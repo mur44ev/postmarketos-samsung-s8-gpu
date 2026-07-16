@@ -1,0 +1,9 @@
+*.so
+*.bin
+*.img
+*.ko
+*.tar*
+*.log
+core*
+.env
+secrets/

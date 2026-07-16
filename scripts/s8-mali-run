@@ -1,0 +1,25 @@
+#!/bin/sh
+set -eu
+
+[ -r /mnt/android-system/vendor/lib64/egl/libGLES_mali.so ] || {
+    echo "s8-mali-run: Android SYSTEM is not mounted" >&2
+    exit 1
+}
+[ -r /dev/mali0 ] && [ -r /dev/ion ] || {
+    echo "s8-mali-run: current user needs video-group access to mali0 and ion" >&2
+    exit 1
+}
+
+export HYBRIS_LD_LIBRARY_PATH=/mnt/android-system/vendor/lib64:/mnt/android-system/lib64
+export HYBRIS_EGLPLATFORM=x11
+export HYBRIS_EGLPLATFORM_DIR=/opt/libhybris-s8/lib/libhybris
+export HYBRIS_ANDROID_SDK_VERSION=28
+export HYBRIS_FORCE_LEGACY_PROPERTIES=1
+export HYBRIS_GRALLOC1_RELEASE_IMPLY_DELETE=1
+export HYBRIS_PTHREAD_KEY_ZERO_VALID=1
+export LIBEGL=libGLES_mali.so
+export LIBGLESV2=libGLES_mali.so
+export LIBGLESV1=libGLES_mali.so
+export LD_LIBRARY_PATH=/opt/libhybris-s8/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+
+exec "$@"

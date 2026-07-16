@@ -1,0 +1,29 @@
+Samsung Galaxy S8 / Exynos8895 — 2026-07-16
+
+EGL_VENDOR=ARM
+EGL_VERSION=1.4 Bifrost-r16p0-01rel0
+GL_VENDOR=ARM
+GL_RENDERER=Mali-G71
+GLES=3.2  GLSL_ES=3.20
+
+Visible physical-panel cube after controlled reboot:
+FRAMES=3600 ELAPSED_SEC=60.000 FPS=60.00
+FRAME_MS_AVG=16.667 P50=16.673 P95=18.434 P99=19.065
+MALI_IRQ_DELTA=10897 DECON_IRQ_DELTA=10857
+RESET_COUNT=0 MMU_FAULT_COUNT=0 TEMPERATURE=30.3C
+
+Final user-observed touch run:
+908 frames / 15.134 s / 60.00 FPS; rotating cube tapped closed.
+
+gl4es GLX:
+GL_VENDOR=GL4ES wrapping ARM
+GL_RENDERER=GL4ES using Mali-G71
+GL_VERSION=2.1 gl4es wrapper 1.1.7
+600 frames / 4.371200 s = 137.26 FPS; GL_ERROR=0x0
+
+Offscreen:
+240 draw/readback frames PASS; 14179.79 FPS; pixel RGBA=243,128,191,255
+
+Stock inputs (not redistributed):
+libGLES_mali.so  67f07575f92ea0aedb8522140a7ad08d3be201e3a07eaa5e42a7f7d751d9fac4
+gralloc.exynos5.so 919bf9f118b3116fc8c403db8e1f863c64e0d3963ff2e74f158e5e2e584a7df7

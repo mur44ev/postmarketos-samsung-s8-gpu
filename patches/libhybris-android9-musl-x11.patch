@@ -1,0 +1,2520 @@
+diff --git a/hybris/common/hooks.c b/hybris/common/hooks.c
+index 2292a32..317fa4b 100644
+--- a/hybris/common/hooks.c
++++ b/hybris/common/hooks.c
+@@ -80,6 +80,10 @@ extern int my_property_list(void (*propfn)(const char *key, const char *value, v
+ 
+ #include <hybris/common/hooks.h>
+ 
++#ifndef __GLIBC__
++#include <hybris/common/musl_compat.h>
++#endif
++
+ #include <android-config.h>
+ 
+ // this is also used in bionic:
+@@ -418,8 +422,11 @@ static void* _hybris_hook_pthread_getspecific(pthread_key_t key)
+ {
+     TRACE_HOOK("key %d", key);
+ 
+-    // see android_bionic/tests/pthread_test.cpp, test static_pthread_key_used_before_creation
+-    if(!key) return NULL;
++    // Bionic treats an uncreated static key (zero) as empty. On musl, however,
++    // pthread_key_create can legitimately allocate key zero. Samsung's Mali
++    // EGL uses that first key for its per-thread current display/context data.
++    // Opt in to host key-zero semantics for such blobs instead of discarding it.
++    if (!key && !getenv("HYBRIS_PTHREAD_KEY_ZERO_VALID")) return NULL;
+ 
+     return pthread_getspecific(key);
+ }
+@@ -531,6 +538,7 @@ static int _hybris_hook_pthread_attr_getstacksize(pthread_attr_t const *__attr,
+     return pthread_attr_getstacksize(realattr, stack_size);
+ }
+ 
++#ifdef __GLIBC__
+ static int _hybris_hook_pthread_attr_setstackaddr(pthread_attr_t *__attr, void *stack_addr)
+ {
+     pthread_attr_t *realattr = (pthread_attr_t *) *(uintptr_t *) __attr;
+@@ -548,6 +556,7 @@ static int _hybris_hook_pthread_attr_getstackaddr(pthread_attr_t const *__attr,
+ 
+     return pthread_attr_getstackaddr(realattr, stack_addr);
+ }
++#endif
+ 
+ static int _hybris_hook_pthread_attr_setstack(pthread_attr_t *__attr, void *stack_base, size_t stack_size)
+ {
+@@ -1134,6 +1143,7 @@ static int _hybris_hook_pthread_rwlockattr_getpshared(pthread_rwlockattr_t *__at
+     return pthread_rwlockattr_getpshared(realattr, pshared);
+ }
+ 
++#ifdef __GLIBC__
+ int _hybris_hook_pthread_rwlockattr_setkind_np(pthread_rwlockattr_t *attr, int pref)
+ {
+     pthread_rwlockattr_t *realattr = (pthread_rwlockattr_t *) *(uintptr_t *) attr;
+@@ -1151,6 +1161,7 @@ int _hybris_hook_pthread_rwlockattr_getkind_np(const pthread_rwlockattr_t *attr,
+ 
+     return pthread_rwlockattr_getkind_np(realattr, pref);
+ }
++#endif
+ 
+ /*
+  * pthread_rwlock_* functions
+@@ -1500,10 +1511,14 @@ static int _hybris_hook_fgetpos(FILE *fp, bionic_fpos_t *pos)
+ {
+     TRACE_HOOK("fp %p pos %p", fp, pos);
+ 
++#ifdef __GLIBC__
+     fpos_t my_fpos;
+     int ret = fgetpos(_get_actual_fp(fp), &my_fpos);
+ 
+     *pos = my_fpos.__pos;
++#else
++    int ret = fgetpos(_get_actual_fp(fp), pos);
++#endif
+ 
+     return ret;
+ }
+@@ -1589,12 +1604,16 @@ static int _hybris_hook_fsetpos(FILE *fp, const bionic_fpos_t *pos)
+ {
+     TRACE_HOOK("fp %p pos %p", fp, pos);
+ 
++#ifdef __GLIBC__
+     fpos_t my_fpos;
+     my_fpos.__pos = *pos;
+     memset(&my_fpos.__state, 0, sizeof(mbstate_t));
+     mbsinit(&my_fpos.__state);
+ 
+     return fsetpos(_get_actual_fp(fp), &my_fpos);
++#else
++    return fsetpos(_get_actual_fp(fp), pos);
++#endif
+ }
+ 
+ static long _hybris_hook_ftell(FILE *fp)
+@@ -1872,6 +1891,7 @@ static int _hybris_hook_versionsort(struct bionic_dirent **a,
+     return strverscmp((*a)->d_name, (*b)->d_name);
+ }
+ 
++#ifdef __GLIBC__
+ static int _hybris_hook_scandirat(int fd, const char *dir,
+                       struct bionic_dirent ***namelist,
+                       int (*filter) (const struct bionic_dirent *),
+@@ -1933,6 +1953,7 @@ static int _hybris_hook_scandir(const char *dir,
+ {
+     return _hybris_hook_scandirat(AT_FDCWD, dir, namelist, filter, compar);
+ }
++#endif
+ 
+ static inline void swap(void **a, void **b)
+ {
+@@ -2190,6 +2211,7 @@ int _hybris_hook_open(const char *pathname, int flags, ...)
+     return open(target_path, flags, mode);
+ }
+ 
++#ifdef __GLIBC__
+ /**
+  * Wrap some GCC builtin functions, which don't have any address
+  */
+@@ -2215,6 +2237,7 @@ __THROW int _hybris_hook___snprintf_chk (char *__restrict __s, size_t __n, int _
+ 
+     return ret;
+ }
++#endif
+ 
+ static __thread void *tls_hooks[16];
+ 
+@@ -2360,6 +2383,15 @@ static char* _hybris_hook_setlocale(int category, const char *locale)
+     return setlocale(category, locale);
+ }
+ 
++/* Bionic libc++ calls this exported libc helper directly. Letting it resolve
++ * to bionic libc dereferences Android TLS, which is not initialized in a musl
++ * process. UTF-8 locales use at most four bytes per multibyte character. */
++static size_t _hybris_hook___ctype_get_mb_cur_max(void)
++{
++    return 4;
++}
++
++#ifdef __GLIBC__
+ static void* _hybris_hook_mmap(void *addr, size_t len, int prot,
+                   int flags, int fd, off_t offset)
+ {
+@@ -2375,6 +2407,7 @@ static int _hybris_hook_munmap(void *addr, size_t length)
+ 
+     return munmap(addr, length);
+ }
++#endif
+ 
+ extern size_t strlcat(char *dst, const char *src, size_t siz);
+ extern size_t strlcpy(char *dst, const char *src, size_t siz);
+@@ -2695,7 +2728,9 @@ static struct _hook hooks_common[] = {
+     HOOK_DIRECT_NO_DEBUG(realloc),
+     HOOK_DIRECT_NO_DEBUG(memalign),
+     HOOK_DIRECT_NO_DEBUG(valloc),
++#ifdef __GLIBC__
+     HOOK_DIRECT_NO_DEBUG(pvalloc),
++#endif
+     HOOK_DIRECT(fread),
+     HOOK_DIRECT_NO_DEBUG(getxattr),
+     HOOK_DIRECT(mprotect),
+@@ -2745,8 +2780,10 @@ static struct _hook hooks_common[] = {
+     HOOK_DIRECT_NO_DEBUG(bcopy),
+     HOOK_DIRECT_NO_DEBUG(bzero),
+     HOOK_DIRECT_NO_DEBUG(ffs),
++#ifdef __GLIBC__
+     HOOK_INDIRECT(__sprintf_chk),
+     HOOK_INDIRECT(__snprintf_chk),
++#endif
+     /* pthread.h */
+     HOOK_DIRECT_NO_DEBUG(getauxval),
+     HOOK_INDIRECT(gettid),
+@@ -2805,8 +2842,10 @@ static struct _hook hooks_common[] = {
+     HOOK_INDIRECT(pthread_attr_getschedparam),
+     HOOK_INDIRECT(pthread_attr_setstacksize),
+     HOOK_INDIRECT(pthread_attr_getstacksize),
++#ifdef __GLIBC__
+     HOOK_INDIRECT(pthread_attr_setstackaddr),
+     HOOK_INDIRECT(pthread_attr_getstackaddr),
++#endif
+     HOOK_INDIRECT(pthread_attr_setstack),
+     HOOK_INDIRECT(pthread_attr_getstack),
+     HOOK_INDIRECT(pthread_attr_setguardsize),
+@@ -2928,8 +2967,10 @@ static struct _hook hooks_common[] = {
+     HOOK_DIRECT_NO_DEBUG(seekdir),
+     HOOK_DIRECT_NO_DEBUG(telldir),
+     HOOK_DIRECT_NO_DEBUG(dirfd),
++#ifdef __GLIBC__
+     HOOK_INDIRECT(scandir),
+     HOOK_INDIRECT(scandirat),
++#endif
+     HOOK_INDIRECT(alphasort),
+     HOOK_INDIRECT(versionsort),
+     /* fcntl.h */
+@@ -2953,7 +2994,9 @@ static struct _hook hooks_common[] = {
+     HOOK_DIRECT_NO_DEBUG(localtime_r),
+     HOOK_DIRECT_NO_DEBUG(gmtime),
+     HOOK_DIRECT_NO_DEBUG(abort),
++#ifdef __GLIBC__
+     HOOK_DIRECT_NO_DEBUG(writev),
++#endif
+     /* unistd.h */
+     HOOK_DIRECT_NO_DEBUG(access),
+     /* grp.h */
+@@ -2983,13 +3026,17 @@ static struct _hook hooks_mm[] = {
+     HOOK_DIRECT(putenv),
+     HOOK_DIRECT(clearenv),
+     HOOK_DIRECT_NO_DEBUG(dprintf),
++#ifdef __GLIBC__
+     HOOK_DIRECT_NO_DEBUG(mallinfo),
++#endif
+     HOOK_DIRECT(malloc_usable_size),
+     HOOK_DIRECT(posix_memalign),
+     HOOK_DIRECT(mprotect),
+     HOOK_TO(__gnu_strerror_r, _hybris_hook__gnu_strerror_r),
++#ifdef __GLIBC__
+     HOOK_INDIRECT(pthread_rwlockattr_getkind_np),
+     HOOK_INDIRECT(pthread_rwlockattr_setkind_np),
++#endif
+     /* unistd.h */
+     HOOK_DIRECT(fork),
+     HOOK_DIRECT_NO_DEBUG(ttyname),
+@@ -3010,16 +3057,23 @@ static struct _hook hooks_mm[] = {
+     HOOK_DIRECT(uselocale),
+     HOOK_DIRECT(localeconv),
+     HOOK_DIRECT(setlocale),
++    HOOK_INDIRECT(__ctype_get_mb_cur_max),
+     /* sys/mman.h */
++#ifdef __GLIBC__
++    // mmap from musl considers offsets from gralloc to be invalid,
++    // so avoid hooking it
+     HOOK_DIRECT(mmap),
+     HOOK_DIRECT(munmap),
++#endif
+     /* wchar.h */
+     HOOK_DIRECT_NO_DEBUG(wmemchr),
+     HOOK_DIRECT_NO_DEBUG(wmemcmp),
+     HOOK_DIRECT_NO_DEBUG(wmemcpy),
+     HOOK_DIRECT_NO_DEBUG(wmemmove),
+     HOOK_DIRECT_NO_DEBUG(wmemset),
++#ifdef __GLIBC__
+     HOOK_DIRECT_NO_DEBUG(wmempcpy),
++#endif
+     HOOK_INDIRECT(fputws),
+     // It's enough to hook vfwprintf here as fwprintf will call it with a
+     // proper va_list in place so we don't have to handle this here.
+@@ -3073,9 +3127,11 @@ static struct _hook hooks_mm[] = {
+     /* dirent.h */
+     HOOK_TO(readdir64, _hybris_hook_readdir),
+     HOOK_TO(readdir64_r, _hybris_hook_readdir_r),
++#ifdef __GLIBC__
+     HOOK_INDIRECT(scandir),
+     HOOK_INDIRECT(scandirat),
+     HOOK_TO(scandir64, _hybris_hook_scandir),
++#endif
+ };
+ 
+ 
+@@ -3199,7 +3255,7 @@ static void* __hybris_get_hooked_symbol(const char *sym, const char *requester)
+     // make sure to skip the property hooks only when o.so is actually loaded
+     // since for testing and we sometimes set things like 99 as sdk version.
+     // The o linker is loaded when sdk_version >= 27 and exists.
+-    if (!found && sdk_version < 27)
++    if (!found && (sdk_version < 27 || getenv("HYBRIS_FORCE_LEGACY_PROPERTIES")))
+         found = bsearch(&key, hooks_properties, HOOKS_SIZE(hooks_properties), sizeof(hooks_properties[0]), hook_cmp);
+ 
+     if (!found)
+@@ -3372,7 +3428,7 @@ void* android_dlsym(void* handle, const char* symbol)
+     ENSURE_LINKER_IS_LOADED();
+ 
+     // do not use hybris properties for older linkers
+-    if (get_android_sdk_version() < 27) {
++    if (get_android_sdk_version() < 27 || getenv("HYBRIS_FORCE_LEGACY_PROPERTIES")) {
+         if (!strcmp(symbol, "property_list")) {
+             return my_property_list;
+         }
+diff --git a/hybris/common/hooks_shm.c b/hybris/common/hooks_shm.c
+index c90cee5..27dfeef 100644
+--- a/hybris/common/hooks_shm.c
++++ b/hybris/common/hooks_shm.c
+@@ -33,6 +33,10 @@
+ #include <sys/shm.h>
+ #include <sys/mman.h>
+ 
++#ifndef __GLIBC__
++#include <hybris/common/musl_compat.h>
++#endif
++
+ /* Debug */
+ #include "logging.h"
+ #define LOGD(message, ...) HYBRIS_DEBUG_LOG(HOOKS, message, ##__VA_ARGS__)
+diff --git a/hybris/common/jb/dlfcn.c b/hybris/common/jb/dlfcn.c
+index 78500e4..6996527 100644
+--- a/hybris/common/jb/dlfcn.c
++++ b/hybris/common/jb/dlfcn.c
+@@ -23,6 +23,10 @@
+ #include "linker.h"
+ #include "linker_format.h"
+ 
++#ifndef PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP
++#define PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP {{PTHREAD_MUTEX_RECURSIVE}}
++#endif
++
+ /* This file hijacks the symbols stubbed out in libdl.so. */
+ 
+ #define DL_SUCCESS                    0
+diff --git a/hybris/common/legacy_properties/properties.c b/hybris/common/legacy_properties/properties.c
+index 0191e7c..c96bd59 100644
+--- a/hybris/common/legacy_properties/properties.c
++++ b/hybris/common/legacy_properties/properties.c
+@@ -36,6 +36,9 @@
+ #include <poll.h>
+ 
+ #include <hybris/properties/properties.h>
++#ifndef __GLIBC__
++#include <hybris/common/musl_compat.h>
++#endif
+ #include "properties_p.h"
+ 
+ static const char property_service_socket[] = "/dev/socket/" PROP_SERVICE_NAME;
+diff --git a/hybris/common/mm/bionic/libc/include/link.h b/hybris/common/mm/bionic/libc/include/link.h
+index cb8e139..10d105d 100644
+--- a/hybris/common/mm/bionic/libc/include/link.h
++++ b/hybris/common/mm/bionic/libc/include/link.h
+@@ -29,6 +29,7 @@
+ #define _LINK_H_
+ 
+ #include <sys/types.h>
++#include <sys/cdefs.h>
+ #include <elf.h>
+ 
+ __BEGIN_DECLS
+diff --git a/hybris/common/mm/bionic/libc/private/libc_logging.h b/hybris/common/mm/bionic/libc/private/libc_logging.h
+index 6beb47e..e526c03 100644
+--- a/hybris/common/mm/bionic/libc/private/libc_logging.h
++++ b/hybris/common/mm/bionic/libc/private/libc_logging.h
+@@ -33,6 +33,8 @@
+ #include <stdarg.h>
+ #include <stddef.h>
+ #include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
+ 
+ __BEGIN_DECLS
+ 
+@@ -73,7 +75,18 @@ struct abort_msg_t {
+ // Formats a message to the log (priority 'fatal'), then aborts.
+ //
+ 
++#ifdef __GLIBC__
+  void __libc_fatal(const char* format, ...);
++#else
++void inline __libc_fatal(const char* format, ...)
++{
++  va_list ap;
++  va_start(ap, format);
++  vfprintf(stderr, format, ap);
++  va_end(ap);
++  abort();
++}
++#endif
+ 
+ //
+ // Formats a message to the log (priority 'fatal'), but doesn't abort.
+diff --git a/hybris/common/mm/dlfcn.cpp b/hybris/common/mm/dlfcn.cpp
+index 13976db..d0ec9e5 100644
+--- a/hybris/common/mm/dlfcn.cpp
++++ b/hybris/common/mm/dlfcn.cpp
+@@ -31,6 +31,10 @@
+ 
+ #include "hybris_compat.h"
+ 
++#ifndef PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP
++#define PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP {{PTHREAD_MUTEX_RECURSIVE}}
++#endif
++
+ #ifdef WANT_ARM_TRACING
+ #include "../wrappers.h"
+ #endif
+diff --git a/hybris/common/mm/hybris_compat.h b/hybris/common/mm/hybris_compat.h
+index 2e10383..de1d852 100644
+--- a/hybris/common/mm/hybris_compat.h
++++ b/hybris/common/mm/hybris_compat.h
+@@ -32,6 +32,9 @@
+ 
+ #include <string.h>
+ #include <memory.h>
++#ifndef __GLIBC__
++#include <hybris/common/musl_compat.h>
++#endif
+ 
+ extern "C" size_t strlcpy(char *dest, const char *src, size_t size);
+ extern "C" size_t strlcat(char *dst, const char *src, size_t size);
+@@ -55,4 +58,12 @@ extern "C" size_t strlcat(char *dst, const char *src, size_t size);
+ #define DT_ANDROID_RELA (DT_LOOS + 4)
+ #define DT_ANDROID_RELASZ (DT_LOOS + 5)
+ 
++#if defined (__aarch64__)
++
++#ifndef R_AARCH64_IRELATIVE
++#define R_AARCH64_IRELATIVE 1032
++#endif
++
++#endif
++
+ #endif
+diff --git a/hybris/common/mm/linker.cpp b/hybris/common/mm/linker.cpp
+index 34f93d3..cd4402e 100644
+--- a/hybris/common/mm/linker.cpp
++++ b/hybris/common/mm/linker.cpp
+@@ -38,6 +38,9 @@
+ #include <sys/mman.h>
+ #include <sys/param.h>
+ #include <unistd.h>
++#ifndef __GLIBC__
++#include <libgen.h>
++#endif
+ 
+ #include <new>
+ #include <string>
+@@ -1193,7 +1196,11 @@ static const char* fix_dt_needed(const char* dt_needed, const char* sopath) {
+ #if !defined(__LP64__)
+   // Work around incorrect DT_NEEDED entries for old apps: http://b/21364029
+   if (get_application_target_sdk_version() <= 22) {
++#ifdef __GLIBC__
+     const char* bname = basename(dt_needed);
++#else
++    const char* bname = (const char*) basename((char*)dt_needed);
++#endif
+     if (bname != dt_needed) {
+       DL_WARN("'%s' library has invalid DT_NEEDED entry '%s'", sopath, dt_needed);
+     }
+@@ -2924,7 +2931,11 @@ bool soinfo::prelink_image() {
+   // the main executable and linker; they do not need to have dt_soname
+   if (soname_ == nullptr && this != somain && (flags_ & FLAG_LINKER) == 0 &&
+       get_application_target_sdk_version() <= 22) {
++#ifdef __GLIBC__
+     soname_ = basename(realpath_.c_str());
++#else
++    soname_ = (const char*) basename((char*) realpath_.c_str());
++#endif
+     DL_WARN("%s: is missing DT_SONAME will use basename as a replacement: \"%s\"",
+         get_realpath(), soname_);
+   }
+diff --git a/hybris/common/n/bionic/libc/include/dlfcn.h b/hybris/common/n/bionic/libc/include/dlfcn.h
+index c2e8980..692ce52 100644
+--- a/hybris/common/n/bionic/libc/include/dlfcn.h
++++ b/hybris/common/n/bionic/libc/include/dlfcn.h
+@@ -46,8 +46,8 @@ typedef struct {
+ extern void* dlopen(const char*  filename, int flag);
+ extern int dlclose(void*  handle);
+ extern const char* dlerror(void);
+-extern void* dlsym(void* handle, const char* symbol) __nonnull((2));
+-extern void* dlvsym(void* handle, const char* symbol, const char* version) __nonnull((2, 3));
++extern void* dlsym(void* handle, const char* symbol) __attribute__((nonnull((2))));
++extern void* dlvsym(void* handle, const char* symbol, const char* version) __attribute__((nonnull((2, 3))));
+ extern int dladdr(const void* addr, Dl_info *info);
+ 
+ enum {
+diff --git a/hybris/common/n/bionic/libc/include/link.h b/hybris/common/n/bionic/libc/include/link.h
+index cb8e139..10d105d 100644
+--- a/hybris/common/n/bionic/libc/include/link.h
++++ b/hybris/common/n/bionic/libc/include/link.h
+@@ -29,6 +29,7 @@
+ #define _LINK_H_
+ 
+ #include <sys/types.h>
++#include <sys/cdefs.h>
+ #include <elf.h>
+ 
+ __BEGIN_DECLS
+diff --git a/hybris/common/n/bionic/libc/private/libc_logging.h b/hybris/common/n/bionic/libc/private/libc_logging.h
+index a696cec..2da0238 100644
+--- a/hybris/common/n/bionic/libc/private/libc_logging.h
++++ b/hybris/common/n/bionic/libc/private/libc_logging.h
+@@ -33,6 +33,8 @@
+ #include <stdarg.h>
+ #include <stddef.h>
+ #include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
+ 
+ __BEGIN_DECLS
+ 
+@@ -73,7 +75,18 @@ struct abort_msg_t {
+ // Formats a message to the log (priority 'fatal'), then aborts.
+ //
+ 
+-void __libc_fatal(const char* format, ...);
++#ifdef __GLIBC__
++ void __libc_fatal(const char* format, ...);
++#else
++void inline __libc_fatal(const char* format, ...)
++{
++  va_list ap;
++  va_start(ap, format);
++  vfprintf(stderr, format, ap);
++  va_end(ap);
++  abort();
++}
++#endif
+ 
+ //
+ // Formats a message to the log (priority 'fatal'), but doesn't abort.
+diff --git a/hybris/common/n/dlfcn.cpp b/hybris/common/n/dlfcn.cpp
+index 92c1349..bfdbb9c 100644
+--- a/hybris/common/n/dlfcn.cpp
++++ b/hybris/common/n/dlfcn.cpp
+@@ -30,6 +30,10 @@
+ 
+ #include "hybris_compat.h"
+ 
++#ifndef PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP
++#define PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP {{PTHREAD_MUTEX_RECURSIVE}}
++#endif
++
+ /* This file hijacks the symbols stubbed out in libdl.so. */
+ 
+ static pthread_mutex_t g_dl_mutex = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
+diff --git a/hybris/common/n/hybris_compat.cpp b/hybris/common/n/hybris_compat.cpp
+index cfe1e78..5238409 100644
+--- a/hybris/common/n/hybris_compat.cpp
++++ b/hybris/common/n/hybris_compat.cpp
+@@ -27,3 +27,11 @@
+  */
+ 
+ #include "hybris_compat.h"
++
++#ifndef __GLIBC__
++const char *gnu_basename(const char *path)
++{
++    char *base = strrchr(path, '/');
++    return base ? base + 1 : path;
++}
++#endif
+diff --git a/hybris/common/n/hybris_compat.h b/hybris/common/n/hybris_compat.h
+index 2e10383..77a0919 100644
+--- a/hybris/common/n/hybris_compat.h
++++ b/hybris/common/n/hybris_compat.h
+@@ -32,6 +32,9 @@
+ 
+ #include <string.h>
+ #include <memory.h>
++#ifndef __GLIBC__
++#include <hybris/common/musl_compat.h>
++#endif
+ 
+ extern "C" size_t strlcpy(char *dest, const char *src, size_t size);
+ extern "C" size_t strlcat(char *dst, const char *src, size_t size);
+@@ -55,4 +58,23 @@ extern "C" size_t strlcat(char *dst, const char *src, size_t size);
+ #define DT_ANDROID_RELA (DT_LOOS + 4)
+ #define DT_ANDROID_RELASZ (DT_LOOS + 5)
+ 
++#if defined (__aarch64__)
++
++#ifndef R_AARCH64_TLS_DTPREL32
++#define R_AARCH64_TLS_DTPREL32 1031
++#endif
++
++#ifndef R_AARCH64_IRELATIVE
++#define R_AARCH64_IRELATIVE 1032
++#endif
++
++#endif
++
++#ifndef __GLIBC__
++#ifndef basename
++const char *gnu_basename(const char *path);
++#define basename gnu_basename
++#endif
++#endif
++
+ #endif
+diff --git a/hybris/common/o/bionic/libc/include/dlfcn.h b/hybris/common/o/bionic/libc/include/dlfcn.h
+index acec4a2..3943882 100644
+--- a/hybris/common/o/bionic/libc/include/dlfcn.h
++++ b/hybris/common/o/bionic/libc/include/dlfcn.h
+@@ -57,11 +57,11 @@ typedef struct {
+ } Dl_info;
+ 
+ void* dlopen(const char* filename, int flag);
+-int dlclose(void* handle) __nonnull((1));
++int dlclose(void* handle) __attribute__((nonnull((1))));
+ char* dlerror(void);
+-void* dlsym(void* handle, const char* symbol) __nonnull((2));
+-void* dlvsym(void* handle, const char* symbol, const char* version) __nonnull((2, 3));
+-int dladdr(const void* addr, Dl_info* info) __nonnull((2));
++void* dlsym(void* handle, const char* symbol) __attribute__((nonnull((2))));
++void* dlvsym(void* handle, const char* symbol, const char* version) __attribute__((nonnull((2, 3))));
++int dladdr(const void* addr, Dl_info* info) __attribute__((nonnull((2))));
+ 
+ #define RTLD_LOCAL    0
+ #define RTLD_LAZY     0x00001
+diff --git a/hybris/common/o/dlfcn.cpp b/hybris/common/o/dlfcn.cpp
+index 6fddbbb..f98f4d2 100644
+--- a/hybris/common/o/dlfcn.cpp
++++ b/hybris/common/o/dlfcn.cpp
+@@ -42,6 +42,10 @@
+ #include "private/bionic_tls.h"
+ #include "private/ScopedPthreadMutexLocker.h"
+ 
++#ifndef PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP
++#define PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP {{PTHREAD_MUTEX_RECURSIVE}}
++#endif
++
+ static pthread_mutex_t g_dl_mutex = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
+ 
+ static __thread char *dl_err_str;
+diff --git a/hybris/common/o/hybris_compat.cpp b/hybris/common/o/hybris_compat.cpp
+index cfe1e78..5238409 100644
+--- a/hybris/common/o/hybris_compat.cpp
++++ b/hybris/common/o/hybris_compat.cpp
+@@ -27,3 +27,11 @@
+  */
+ 
+ #include "hybris_compat.h"
++
++#ifndef __GLIBC__
++const char *gnu_basename(const char *path)
++{
++    char *base = strrchr(path, '/');
++    return base ? base + 1 : path;
++}
++#endif
+diff --git a/hybris/common/o/hybris_compat.h b/hybris/common/o/hybris_compat.h
+index 2e10383..77a0919 100644
+--- a/hybris/common/o/hybris_compat.h
++++ b/hybris/common/o/hybris_compat.h
+@@ -32,6 +32,9 @@
+ 
+ #include <string.h>
+ #include <memory.h>
++#ifndef __GLIBC__
++#include <hybris/common/musl_compat.h>
++#endif
+ 
+ extern "C" size_t strlcpy(char *dest, const char *src, size_t size);
+ extern "C" size_t strlcat(char *dst, const char *src, size_t size);
+@@ -55,4 +58,23 @@ extern "C" size_t strlcat(char *dst, const char *src, size_t size);
+ #define DT_ANDROID_RELA (DT_LOOS + 4)
+ #define DT_ANDROID_RELASZ (DT_LOOS + 5)
+ 
++#if defined (__aarch64__)
++
++#ifndef R_AARCH64_TLS_DTPREL32
++#define R_AARCH64_TLS_DTPREL32 1031
++#endif
++
++#ifndef R_AARCH64_IRELATIVE
++#define R_AARCH64_IRELATIVE 1032
++#endif
++
++#endif
++
++#ifndef __GLIBC__
++#ifndef basename
++const char *gnu_basename(const char *path);
++#define basename gnu_basename
++#endif
++#endif
++
+ #endif
+diff --git a/hybris/configure.ac b/hybris/configure.ac
+index 2bf69a9..b088857 100644
+--- a/hybris/configure.ac
++++ b/hybris/configure.ac
+@@ -271,6 +271,7 @@ AC_CONFIG_FILES([
+ 	egl/platforms/null/Makefile
+ 	egl/platforms/fbdev/Makefile
+ 	egl/platforms/wayland/Makefile
++	egl/platforms/x11/Makefile
+ 	egl/platforms/hwcomposer/Makefile
+ 	egl/platforms/hwcomposer/hwcomposer-egl.pc
+ 	glesv1/glesv1_cm.pc
+diff --git a/hybris/egl/egl.c b/hybris/egl/egl.c
+index f6dcd09..4da4128 100644
+--- a/hybris/egl/egl.c
++++ b/hybris/egl/egl.c
+@@ -228,7 +228,6 @@ const char * eglQueryString(EGLDisplay dpy, EGLint name)
+ 
+ HYBRIS_IMPLEMENT_FUNCTION4(egl, EGLBoolean, eglGetConfigs, EGLDisplay, EGLConfig *, EGLint, EGLint *);
+ HYBRIS_IMPLEMENT_FUNCTION5(egl, EGLBoolean, eglChooseConfig, EGLDisplay, const EGLint *, EGLConfig *, EGLint, EGLint *);
+-HYBRIS_IMPLEMENT_FUNCTION4(egl, EGLBoolean, eglGetConfigAttrib, EGLDisplay, EGLConfig, EGLint, EGLint *);
+ 
+ EGLSurface eglCreateWindowSurface(EGLDisplay dpy, EGLConfig config,
+ 		EGLNativeWindowType win,
+@@ -343,6 +342,10 @@ EGLBoolean _my_eglSwapBuffersWithDamageEXT(EGLDisplay dpy, EGLSurface surface, E
+ 		win = egl_helper_get_mapping(surface);
+ 		ws_prepareSwap(dpy, win, rects, n_rects);
+ 		ret = (*_eglSwapBuffers)(dpy, surface);
++		if (ret == EGL_FALSE && getenv("HYBRIS_WINDOW_DEBUG")) {
++			HYBRIS_DLSYSM(egl, &_eglGetError, "eglGetError");
++			fprintf(stderr, "libhybris: native eglSwapBuffers failed: 0x%04x\n", (*_eglGetError)());
++		}
+ 		ws_finishSwap(dpy, win);
+ 	} else {
+ 		ret = (*_eglSwapBuffers)(dpy, surface);
+@@ -461,4 +464,16 @@ EGLBoolean eglDestroyImageKHR(EGLDisplay dpy, EGLImageKHR image)
+ 	return ret;
+ }
+ 
++EGLBoolean eglGetConfigAttrib(EGLDisplay dpy, EGLConfig config, EGLint attribute, EGLint *value)
++{
++	HYBRIS_DLSYSM(egl, &_eglGetConfigAttrib, "eglGetConfigAttrib");
++	struct _EGLDisplay *display = hybris_egl_display_get_mapping(dpy);
++
++    EGLBoolean ret = ws_eglGetConfigAttrib(display, config, attribute, value);
++    if (ret == EGL_FALSE) {
++        return (*_eglGetConfigAttrib)(dpy, config, attribute, value);
++    }
++    return ret;
++}
++
+ // vim:ts=4:sw=4:noexpandtab
+diff --git a/hybris/egl/platforms/Makefile.am b/hybris/egl/platforms/Makefile.am
+index 4126752..c52de15 100644
+--- a/hybris/egl/platforms/Makefile.am
++++ b/hybris/egl/platforms/Makefile.am
+@@ -11,4 +11,4 @@ if WANT_WAYLAND
+ SUBDIRS += wayland
+ endif
+ 
+-
++SUBDIRS += x11
+diff --git a/hybris/egl/platforms/common/nativewindowbase.cpp b/hybris/egl/platforms/common/nativewindowbase.cpp
+index 73775b7..79fcad9 100644
+--- a/hybris/egl/platforms/common/nativewindowbase.cpp
++++ b/hybris/egl/platforms/common/nativewindowbase.cpp
+@@ -7,6 +7,8 @@
+ #endif
+ 
+ #include <string.h>
++#include <stdio.h>
++#include <stdlib.h>
+ #include <system/window.h>
+ #include <system/graphics.h>
+ #include <hardware/gralloc.h>
+@@ -44,6 +46,12 @@ BaseNativeWindowBuffer::BaseNativeWindowBuffer()
+ 	ANativeWindowBuffer::format = 0;
+ 	ANativeWindowBuffer::usage = 0;
+ 	ANativeWindowBuffer::handle = 0;
++#if ANDROID_VERSION_MAJOR>=8
++	ANativeWindowBuffer::usage_deprecated = 0;
++	ANativeWindowBuffer::layerCount = 1;
++	memset(ANativeWindowBuffer::reserved, 0, sizeof(ANativeWindowBuffer::reserved));
++	memset(ANativeWindowBuffer::reserved_proc, 0, sizeof(ANativeWindowBuffer::reserved_proc));
++#endif
+ 
+ 	refcount = 0;
+ }
+@@ -187,6 +195,7 @@ int BaseNativeWindow::_dequeueBuffer(struct ANativeWindow *window, ANativeWindow
+ 	BaseNativeWindowBuffer *nativeBuffer = static_cast<BaseNativeWindowBuffer*>(*buffer);
+ 	int ret = static_cast<BaseNativeWindow*>(window)->dequeueBuffer(&nativeBuffer, fenceFd);
+ 	*buffer = static_cast<ANativeWindowBuffer*>(nativeBuffer);
++	if (getenv("HYBRIS_WINDOW_DEBUG")) fprintf(stderr, "libhybris: dequeue ret=%d buffer=%p fence=%d\n", ret, (void*)nativeBuffer, fenceFd ? *fenceFd : -999);
+ 	return ret;
+ }
+ 
+@@ -202,8 +211,9 @@ int BaseNativeWindow::_queueBuffer(struct ANativeWindow *window, ANativeWindowBu
+ {
+ 	BaseNativeWindow *nativeWindow = static_cast<BaseNativeWindow*>(window);
+ 	BaseNativeWindowBuffer *nativeBuffer = static_cast<BaseNativeWindowBuffer*>(buffer);
+-
+-	return nativeWindow->queueBuffer(nativeBuffer, fenceFd);
++	int ret = nativeWindow->queueBuffer(nativeBuffer, fenceFd);
++	if (getenv("HYBRIS_WINDOW_DEBUG")) fprintf(stderr, "libhybris: queue ret=%d buffer=%p fence=%d\n", ret, (void*)nativeBuffer, fenceFd);
++	return ret;
+ }
+ 
+ int BaseNativeWindow::_cancelBuffer_DEPRECATED(struct ANativeWindow* window, ANativeWindowBuffer* buffer)
+@@ -248,6 +258,10 @@ const char *BaseNativeWindow::_native_window_operation(int what)
+ #if ANDROID_VERSION_MAJOR>=4 && ANDROID_VERSION_MINOR>=1
+ 		case NATIVE_WINDOW_SET_BUFFERS_USER_DIMENSIONS: return "NATIVE_WINDOW_SET_BUFFERS_USER_DIMENSIONS";
+ 		case NATIVE_WINDOW_SET_POST_TRANSFORM_CROP: return "NATIVE_WINDOW_SET_POST_TRANSFORM_CROP";
++#endif
++#if ANDROID_VERSION_MAJOR>=9
++		case NATIVE_WINDOW_SET_USAGE64: return "NATIVE_WINDOW_SET_USAGE64";
++		case NATIVE_WINDOW_GET_CONSUMER_USAGE64: return "NATIVE_WINDOW_GET_CONSUMER_USAGE64";
+ #endif
+ 		default: return "NATIVE_UNKNOWN_OPERATION";
+ 	}
+@@ -274,6 +288,9 @@ const char *BaseNativeWindow::_native_query_operation(int what)
+ #if ANDROID_VERSION_MAJOR>=8
+                 case NATIVE_WINDOW_IS_VALID: return "NATIVE_WINDOW_IS_VALID";
+                 case NATIVE_WINDOW_BUFFER_AGE: return "NATIVE_WINDOW_BUFFER_AGE";
++#endif
++#if ANDROID_VERSION_MAJOR>=9
++                case NATIVE_WINDOW_MAX_BUFFER_COUNT: return "NATIVE_WINDOW_MAX_BUFFER_COUNT";
+ #endif
+ 		default: return "NATIVE_UNKNOWN_QUERY";
+ 	}
+@@ -282,6 +299,7 @@ const char *BaseNativeWindow::_native_query_operation(int what)
+ int BaseNativeWindow::_query(const struct ANativeWindow* window, int what, int* value)
+ {
+ 	TRACE("window:%p %i %s %p", window, what, _native_query_operation(what), value);
++	if (getenv("HYBRIS_WINDOW_DEBUG")) fprintf(stderr, "libhybris: query %d %s\n", what, _native_query_operation(what));
+ 	const BaseNativeWindow* self=static_cast<const BaseNativeWindow*>(window);
+ 	switch (what) {
+ 		case NATIVE_WINDOW_WIDTH:
+@@ -328,6 +346,11 @@ int BaseNativeWindow::_query(const struct ANativeWindow* window, int what, int*
+ 			// sure :)
+ 			*value = 2;
+ 			return NO_ERROR;
++#endif
++#if ANDROID_VERSION_MAJOR>=9
++		case NATIVE_WINDOW_MAX_BUFFER_COUNT:
++			*value = 64;
++			return NO_ERROR;
+ #endif
+ 	}
+ 	TRACE("EGL error: unkown window attribute! %i", what);
+@@ -343,6 +366,7 @@ int BaseNativeWindow::_perform(struct ANativeWindow* window, int operation, ...
+ 
+ 	// FIXME
+ 	TRACE("operation = %s", _native_window_operation(operation));
++	if (getenv("HYBRIS_WINDOW_DEBUG")) fprintf(stderr, "libhybris: perform %d %s\n", operation, _native_window_operation(operation));
+ 	switch(operation) {
+ 	case NATIVE_WINDOW_SET_USAGE                 : //  0,
+ 	{
+@@ -411,6 +435,21 @@ int BaseNativeWindow::_perform(struct ANativeWindow* window, int operation, ...
+ 	case NATIVE_WINDOW_SET_POST_TRANSFORM_CROP   : // 16,
+ 		TRACE("set post transform crop");
+ 		break;
++#endif
++#if ANDROID_VERSION_MAJOR>=9
++	case NATIVE_WINDOW_SET_USAGE64               : // 30,
++	{
++		uint64_t usage = va_arg(args, uint64_t);
++		if (getenv("HYBRIS_WINDOW_DEBUG")) fprintf(stderr, "libhybris: usage64=0x%llx\n", (unsigned long long)usage);
++		va_end(args);
++		return self->setUsage((int)usage);
++	}
++	case NATIVE_WINDOW_GET_CONSUMER_USAGE64      : // 31,
++	{
++		uint64_t* usage = va_arg(args, uint64_t*);
++		*usage = self->getUsage();
++		break;
++	}
+ #endif
+ 	}
+ 	va_end(args);
+diff --git a/hybris/egl/ws.c b/hybris/egl/ws.c
+index ed20a1c..bbe7647 100644
+--- a/hybris/egl/ws.c
++++ b/hybris/egl/ws.c
+@@ -126,4 +126,13 @@ void ws_setSwapInterval(EGLDisplay dpy, EGLNativeWindowType win, EGLint interval
+ 		ws->setSwapInterval(dpy, win, interval);
+ }
+ 
++EGLBoolean ws_eglGetConfigAttrib(struct _EGLDisplay *display, EGLConfig config, EGLint attribute, EGLint *value)
++{
++	_init_ws();
++	if (ws->eglGetConfigAttrib)
++		return ws->eglGetConfigAttrib(display, config, attribute, value);
++    else
++        return EGL_FALSE;
++}
++
+ // vim:ts=4:sw=4:noexpandtab
+diff --git a/hybris/egl/ws.h b/hybris/egl/ws.h
+index c4811c0..92b221a 100644
+--- a/hybris/egl/ws.h
++++ b/hybris/egl/ws.h
+@@ -37,6 +37,7 @@ struct ws_module {
+ 	void (*prepareSwap)(EGLDisplay dpy, EGLNativeWindowType win, EGLint *damage_rects, EGLint damage_n_rects);
+ 	void (*finishSwap)(EGLDisplay dpy, EGLNativeWindowType win);
+ 	void (*setSwapInterval)(EGLDisplay dpy, EGLNativeWindowType win, EGLint interval);
++    EGLBoolean (*eglGetConfigAttrib)(struct _EGLDisplay *display, EGLConfig config, EGLint attribute, EGLint *value);
+ };
+ 
+ struct _EGLDisplay *ws_GetDisplay(EGLNativeDisplayType native);
+@@ -49,5 +50,6 @@ const char *ws_eglQueryString(EGLDisplay dpy, EGLint name, const char *(*real_eg
+ void ws_prepareSwap(EGLDisplay dpy, EGLNativeWindowType win, EGLint *damage_rects, EGLint damage_n_rects);
+ void ws_finishSwap(EGLDisplay dpy, EGLNativeWindowType win);
+ void ws_setSwapInterval(EGLDisplay dpy, EGLNativeWindowType win, EGLint interval);
++EGLBoolean ws_eglGetConfigAttrib(struct _EGLDisplay *display, EGLConfig config, EGLint attribute, EGLint *value);
+ 
+ #endif
+diff --git a/hybris/gralloc/gralloc.c b/hybris/gralloc/gralloc.c
+index 33a7b31..aa150a6 100644
+--- a/hybris/gralloc/gralloc.c
++++ b/hybris/gralloc/gralloc.c
+@@ -178,6 +178,12 @@ static void gralloc1_init(void)
+         free(gralloc1_capabilities);
+     }
+ 
++    /* Samsung's Android 9 Exynos gralloc releases and deletes native handles
++     * but does not advertise GRALLOC1_CAPABILITY_RELEASE_IMPLY_DELETE. Avoid a
++     * host-side native_handle_delete double free when explicitly requested. */
++    if (getenv("HYBRIS_GRALLOC1_RELEASE_IMPLY_DELETE"))
++        gralloc1_release_implies_delete = 1;
++
+     gralloc1_create_descriptor = (GRALLOC1_PFN_CREATE_DESCRIPTOR)gralloc1_device->getFunction(gralloc1_device, GRALLOC1_FUNCTION_CREATE_DESCRIPTOR);
+     gralloc1_destroy_descriptor = (GRALLOC1_PFN_DESTROY_DESCRIPTOR)gralloc1_device->getFunction(gralloc1_device, GRALLOC1_FUNCTION_DESTROY_DESCRIPTOR);
+     gralloc1_set_consumer_usage = (GRALLOC1_PFN_SET_CONSUMER_USAGE)gralloc1_device->getFunction(gralloc1_device, GRALLOC1_FUNCTION_SET_CONSUMER_USAGE);
+diff --git a/hybris/libsync/sync.c b/hybris/libsync/sync.c
+index dbc3eba..e66840a 100644
+--- a/hybris/libsync/sync.c
++++ b/hybris/libsync/sync.c
+@@ -27,6 +27,7 @@
+ #include <linux/sync.h>
+ #include <linux/sw_sync.h>
+ #else
++#include <sys/cdefs.h>
+ #include <sync/sync.h>
+ #endif
+ 
+diff --git a/hybris/tests/Makefile.am b/hybris/tests/Makefile.am
+index 6f97c3e..d9190f6 100644
+--- a/hybris/tests/Makefile.am
++++ b/hybris/tests/Makefile.am
+@@ -1,22 +1,9 @@
++# Keep the musl/Android 4.4 probe build focused on graphics. Several unrelated
++# legacy tests unconditionally require Wayland even for the fbdev platform.
+ bin_PROGRAMS = \
+-	test_audio \
+ 	test_egl \
+ 	test_egl_configs \
+-	test_glesv2 \
+-	test_sf \
+-	test_sensors \
+-	test_input \
+-	test_lights \
+-	test_camera \
+-	test_vibrator \
+-	test_media \
+-	test_recorder \
+-	test_gps \
+-	test_opencl \
+-	test_wifi \
+-	test_hwc2 \
+-	test_hwcomposer \
+-	test_nfc
++	test_glesv2
+ 
+ test_audio_SOURCES = test_audio.c
+ test_audio_CFLAGS = \
+diff --git a/hybris/tests/test_camera.c b/hybris/tests/test_camera.c
+index 7ac81f4..b7993a9 100644
+--- a/hybris/tests/test_camera.c
++++ b/hybris/tests/test_camera.c
+@@ -45,6 +45,10 @@
+ #include <sys/stat.h>
+ #include <sys/types.h>
+ 
++#ifndef __GLIBC__
++#include <hybris/common/musl_compat.h>
++#endif
++
+ int shot_counter = 1;
+ int32_t current_zoom_level = 1;
+ bool new_camera_frame_available = true;
+diff --git a/hybris/egl/platforms/x11/eglplatform_x11.cpp b/hybris/egl/platforms/x11/eglplatform_x11.cpp
+new file mode 100644
+index 0000000..0490737
+--- /dev/null
++++ b/hybris/egl/platforms/x11/eglplatform_x11.cpp
+@@ -0,0 +1,235 @@
++/****************************************************************************************
++**
++** Copyright (C) 2013 Jolla Ltd.
++** Contact: Carsten Munk <carsten.munk@jollamobile.com>
++** All rights reserved.
++**
++** This file is part of X11 enablement for libhybris
++**
++** You may use this file under the terms of the GNU Lesser General
++** Public License version 2.1 as published by the Free Software Foundation
++** and appearing in the file license.lgpl included in the packaging
++** of this file.
++**
++** This library is free software; you can redistribute it and/or
++** modify it under the terms of the GNU Lesser General Public
++** License version 2.1 as published by the Free Software Foundation
++** and appearing in the file license.lgpl included in the packaging
++** of this file.
++**
++** This library is distributed in the hope that it will be useful,
++** but WITHOUT ANY WARRANTY; without even the implied warranty of
++** MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
++** Lesser General Public License for more details.
++**
++****************************************************************************************/
++
++#include <android-config.h>
++#include <ws.h>
++#include <malloc.h>
++#include <assert.h>
++#include <fcntl.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#include <assert.h>
++#include <stdlib.h>
++extern "C" {
++#include <eglplatformcommon.h>
++};
++#include <eglhybris.h>
++
++#include <EGL/eglext.h>
++
++extern "C" {
++#include <wayland-client.h>
++#include <wayland-egl.h>
++}
++
++#include <hybris/gralloc/gralloc.h>
++#include "x11_window.h"
++#include "logging.h"
++
++#include <X11/Xlib.h>
++#include <X11/Xutil.h>
++
++static const char *  (*_eglQueryString)(EGLDisplay dpy, EGLint name) = NULL;
++static __eglMustCastToProperFunctionPointerType (*_eglGetProcAddress)(const char *procname) = NULL;
++static EGLSyncKHR (*_eglCreateSyncKHR)(EGLDisplay dpy, EGLenum type, const EGLint *attrib_list) = NULL;
++static EGLBoolean (*_eglDestroySyncKHR)(EGLDisplay dpy, EGLSyncKHR sync) = NULL;
++static EGLint (*_eglClientWaitSyncKHR)(EGLDisplay dpy, EGLSyncKHR sync, EGLint flags, EGLTimeKHR timeout) = NULL;
++
++struct X11Display {
++	_EGLDisplay base;
++	Display *xl_display;
++};
++
++extern "C" void x11ws_init_module(struct ws_egl_interface *egl_iface)
++{
++	hybris_gralloc_initialize(0);
++	eglplatformcommon_init(egl_iface);
++}
++
++static void _init_egl_funcs(EGLDisplay display)
++{
++	if (_eglQueryString != NULL)
++		return;
++
++	_eglQueryString = (const char * (*)(void*, int))
++			hybris_android_egl_dlsym("eglQueryString");
++	assert(_eglQueryString);
++	_eglGetProcAddress = (__eglMustCastToProperFunctionPointerType (*)(const char *))
++			hybris_android_egl_dlsym("eglGetProcAddress");
++	assert(_eglGetProcAddress);
++
++	const char *extensions = (*_eglQueryString)(display, EGL_EXTENSIONS);
++
++	if (strstr(extensions, "EGL_KHR_fence_sync")) {
++		_eglCreateSyncKHR = (PFNEGLCREATESYNCKHRPROC)
++				(*_eglGetProcAddress)("eglCreateSyncKHR");
++		assert(_eglCreateSyncKHR);
++		_eglDestroySyncKHR = (PFNEGLDESTROYSYNCKHRPROC)
++				(*_eglGetProcAddress)("eglDestroySyncKHR");
++		assert(_eglDestroySyncKHR);
++		_eglClientWaitSyncKHR = (PFNEGLCLIENTWAITSYNCKHRPROC)
++				(*_eglGetProcAddress)("eglClientWaitSyncKHR");
++		assert(_eglClientWaitSyncKHR);
++	}
++}
++
++extern "C" _EGLDisplay *x11ws_GetDisplay(EGLNativeDisplayType display)
++{
++	X11Display *xdpy = new X11Display;
++	xdpy->xl_display = (Display *)display;
++
++	return &xdpy->base;
++}
++
++extern "C" void x11ws_Terminate(_EGLDisplay *dpy)
++{
++	X11Display *xdpy = (X11Display *)dpy;
++	int ret = 0;
++	delete xdpy;
++}
++
++extern "C" EGLNativeWindowType x11ws_CreateWindow(EGLNativeWindowType win, _EGLDisplay *display)
++{
++	Window xlib_window = (Window) win;
++	X11Display *xdpy = (X11Display *)display;
++
++	if (win == 0 || xdpy->xl_display == 0) {
++		HYBRIS_ERROR("Running with EGL_PLATFORM=x11 without X server is not possible");
++		HYBRIS_ERROR("If you want to run a standlone EGL client do it like this:");
++		HYBRIS_ERROR(" $ export EGL_PLATFORM=null");
++		HYBRIS_ERROR(" $ test_glevs2");
++		abort();
++	}
++
++	X11NativeWindow *window = new X11NativeWindow(xdpy->xl_display, xlib_window);
++	window->common.incRef(&window->common);
++	return (EGLNativeWindowType) static_cast<struct ANativeWindow *>(window);
++}
++
++extern "C" void x11ws_DestroyWindow(EGLNativeWindowType win)
++{
++	X11NativeWindow *window = static_cast<X11NativeWindow *>((struct ANativeWindow *)win);
++	window->common.decRef(&window->common);
++}
++
++extern "C" __eglMustCastToProperFunctionPointerType x11ws_eglGetProcAddress(const char *procname)
++{
++	return eglplatformcommon_eglGetProcAddress(procname);
++}
++
++extern "C" void x11ws_passthroughImageKHR(EGLContext *ctx, EGLenum *target, EGLClientBuffer *buffer, const EGLint **attrib_list)
++{
++	eglplatformcommon_passthroughImageKHR(ctx, target, buffer, attrib_list);
++}
++
++extern "C" const char *x11ws_eglQueryString(EGLDisplay dpy, EGLint name, const char *(*real_eglQueryString)(EGLDisplay dpy, EGLint name))
++{
++	const char *ret = eglplatformcommon_eglQueryString(dpy, name, real_eglQueryString);
++	if (ret && name == EGL_EXTENSIONS)
++	{
++		static char eglextensionsbuf[1024];
++		snprintf(eglextensionsbuf, 1022, "%s %s", ret,
++			"EGL_EXT_swap_buffers_with_damage EGL_WL_create_x11_buffer_from_image"
++		);
++		ret = eglextensionsbuf;
++	}
++	return ret;
++}
++
++extern "C" void x11ws_prepareSwap(EGLDisplay dpy, EGLNativeWindowType win, EGLint *damage_rects, EGLint damage_n_rects)
++{
++	X11NativeWindow *window = static_cast<X11NativeWindow *>((struct ANativeWindow *)win);
++	window->prepareSwap(damage_rects, damage_n_rects);
++}
++
++extern "C" void x11ws_finishSwap(EGLDisplay dpy, EGLNativeWindowType win)
++{
++	_init_egl_funcs(dpy);
++	X11NativeWindow *window = static_cast<X11NativeWindow *>((struct ANativeWindow *)win);
++	if (_eglCreateSyncKHR) {
++		EGLSyncKHR sync = (*_eglCreateSyncKHR)(dpy, EGL_SYNC_FENCE_KHR, NULL);
++		(*_eglClientWaitSyncKHR)(dpy, sync, EGL_SYNC_FLUSH_COMMANDS_BIT_KHR, EGL_FOREVER_KHR);
++		(*_eglDestroySyncKHR)(dpy, sync);
++	}
++	window->finishSwap();
++}
++
++extern "C" void x11ws_setSwapInterval(EGLDisplay dpy, EGLNativeWindowType win, EGLint interval)
++{
++	X11NativeWindow *window = static_cast<X11NativeWindow *>((struct ANativeWindow *)win);
++	window->setSwapInterval(interval);
++}
++
++extern "C" EGLBoolean x11ws_eglGetConfigAttrib(struct _EGLDisplay *display, EGLConfig config, EGLint attribute, EGLint *value)
++{
++    TRACE("attribute:%i", attribute);
++    if (attribute == EGL_NATIVE_VISUAL_ID)
++    {
++        X11Display *xdpy = (X11Display *)display;
++        /* Pbuffer/surfaceless users such as WebKit WebGL legitimately pass
++         * EGL_DEFAULT_DISPLAY (NULL). In that case there is no X visual to
++         * translate; defer to the Mali EGL driver's native visual ID. */
++        if (!xdpy->xl_display)
++            return EGL_FALSE;
++        XVisualInfo visinfo_template;
++        XVisualInfo *visinfo = NULL;
++        int visinfos_count = 0;
++
++        visinfo_template.depth = DefaultDepth(xdpy->xl_display,
++                                              DefaultScreen(xdpy->xl_display));
++        visinfo = XGetVisualInfo (xdpy->xl_display,
++                            VisualDepthMask,
++                            &visinfo_template,
++                            &visinfos_count);
++
++        if (visinfos_count)
++        {
++            TRACE("visinfo.visualid:%i", attribute);
++            *value = visinfo->visualid;
++            return EGL_TRUE;
++        }
++
++    }
++    return EGL_FALSE;
++}
++
++struct ws_module ws_module_info = {
++	x11ws_init_module,
++	x11ws_GetDisplay,
++	x11ws_Terminate,
++	x11ws_CreateWindow,
++	x11ws_DestroyWindow,
++	x11ws_eglGetProcAddress,
++	x11ws_passthroughImageKHR,
++	x11ws_eglQueryString,
++	x11ws_prepareSwap,
++	x11ws_finishSwap,
++	x11ws_setSwapInterval,
++    x11ws_eglGetConfigAttrib
++};
+diff --git a/hybris/egl/platforms/x11/Makefile.am b/hybris/egl/platforms/x11/Makefile.am
+new file mode 100644
+index 0000000..4ab00f2
+--- /dev/null
++++ b/hybris/egl/platforms/x11/Makefile.am
+@@ -0,0 +1,43 @@
++pkglib_LTLIBRARIES = eglplatform_x11.la
++
++eglplatform_x11_la_SOURCES = eglplatform_x11.cpp x11_window.cpp xcb_drihybris.c
++eglplatform_x11_la_CXXFLAGS = \
++	-I$(top_srcdir)/common \
++	-I$(top_srcdir)/include \
++	-I$(top_srcdir)/egl \
++	-I$(top_srcdir)/egl/platforms/common \
++	$(ANDROID_HEADERS_CFLAGS) \
++	$(WAYLAND_CLIENT_CFLAGS)
++
++if WANT_DEBUG
++eglplatform_x11_la_CXXFLAGS += -I$(top_srcdir)/common
++endif
++
++if WANT_TRACE
++eglplatform_x11_la_CXXFLAGS += -DDEBUG
++endif
++
++if WANT_DEBUG
++eglplatform_x11_la_CXXFLAGS += -ggdb -O0
++endif
++
++if !WANT_WL_SERVERSIDE_BUFFERS
++eglplatform_x11_la_CXXFLAGS += -DHYBRIS_NO_SERVER_SIDE_BUFFERS
++endif
++
++
++
++eglplatform_x11_la_LDFLAGS = \
++	-avoid-version -module -shared -export-dynamic \
++	$(top_builddir)/egl/platforms/common/libhybris-eglplatformcommon.la \
++	$(top_builddir)/gralloc/libgralloc.la \
++	-lXext -lxcb -lX11-xcb -lxcb-present
++
++if HAS_ANDROID_4_2_0
++eglplatform_x11_la_LDFLAGS += $(top_builddir)/libsync/libsync.la
++endif
++
++if HAS_ANDROID_5_0_0
++eglplatform_x11_la_LDFLAGS += $(top_builddir)/libsync/libsync.la
++endif
++
+diff --git a/hybris/egl/platforms/x11/x11_window.cpp b/hybris/egl/platforms/x11/x11_window.cpp
+new file mode 100644
+index 0000000..542461d
+--- /dev/null
++++ b/hybris/egl/platforms/x11/x11_window.cpp
+@@ -0,0 +1,764 @@
++/****************************************************************************************
++ **
++ ** Copyright (C) 2013 Jolla Ltd.
++ ** Contact: Carsten Munk <carsten.munk@jollamobile.com>
++ ** All rights reserved.
++ **
++ ** This file is part of Wayland enablement for libhybris
++ **
++ ** You may use this file under the terms of the GNU Lesser General
++ ** Public License version 2.1 as published by the Free Software Foundation
++ ** and appearing in the file license.lgpl included in the packaging
++ ** of this file.
++ **
++ ** This library is free software; you can redistribute it and/or
++ ** modify it under the terms of the GNU Lesser General Public
++ ** License version 2.1 as published by the Free Software Foundation
++ ** and appearing in the file license.lgpl included in the packaging
++ ** of this file.
++ **
++ ** This library is distributed in the hope that it will be useful,
++ ** but WITHOUT ANY WARRANTY; without even the implied warranty of
++ ** MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
++ ** Lesser General Public License for more details.
++ **
++ ****************************************************************************************/
++
++#include <android-config.h>
++#include "x11_window.h"
++#include <assert.h>
++#include <stdlib.h>
++#include <string.h>
++#include <errno.h>
++
++#include "logging.h"
++#include <eglhybris.h>
++#include "xcb_drihybris.h"
++
++#if ANDROID_VERSION_MAJOR>=4 && ANDROID_VERSION_MINOR>=2 || ANDROID_VERSION_MAJOR>=5
++extern "C" {
++#include <sync/sync.h>
++}
++#endif
++
++void X11NativeWindow::resize(unsigned int width, unsigned int height)
++{
++    lock();
++    this->m_defaultWidth = this->m_width = width;
++    this->m_defaultHeight = this->m_height = height;
++    unlock();
++}
++
++void X11NativeWindow::lock()
++{
++    pthread_mutex_lock(&this->mutex);
++}
++
++void X11NativeWindow::unlock()
++{
++    pthread_mutex_unlock(&this->mutex);
++}
++
++X11NativeWindow::X11NativeWindow(Display* xl_display, Window xl_window)
++{
++    int wayland_ok;
++
++    HYBRIS_TRACE_BEGIN("x11-platform", "create_window", "");
++    this->m_window = xl_window;
++    this->m_display = xl_display;
++    this->m_connection = XGetXCBConnection(xl_display);
++    this->m_image = 0;
++    this->m_useShm = true;
++    this->m_format = HAL_PIXEL_FORMAT_RGBA_8888;
++
++    const_cast<int&>(ANativeWindow::minSwapInterval) = 0;
++    const_cast<int&>(ANativeWindow::maxSwapInterval) = 1;
++    // This is the default as per the EGL documentation
++    this->m_swap_interval = 1;
++
++    TRACE("getting X11 window information");
++
++    XWindowAttributes window_attributes;
++    XGetWindowAttributes(m_display, m_window, &window_attributes);
++
++    TRACE("window x=%d y=%d width=%d height=%d depth=%d",
++        window_attributes.x,
++        window_attributes.y,
++        window_attributes.width,
++        window_attributes.height,
++        window_attributes.depth);
++
++    m_width = window_attributes.width;
++    m_height = window_attributes.height;
++    m_depth = window_attributes.depth;
++    /* The SM-T561 Xorg fbdev session is RGB565. Keeping gralloc buffers in
++     * the same format avoids a full-frame RGBA8888 conversion and, more
++     * importantly, never asks the underlying framebuffer for 32 bpp. */
++    if (m_depth <= 16)
++        m_format = HAL_PIXEL_FORMAT_RGB_565;
++    else if (m_depth == 24)
++        m_format = HAL_PIXEL_FORMAT_RGBX_8888;
++
++    const char *env = getenv("HYBRIS_X11_FORCE_WIDTH");
++    if (env != NULL)
++    {
++        m_width = atoi(env);
++        TRACE("forced width=%d", m_width);
++    }
++
++    env = getenv("HYBRIS_X11_FORCE_HEIGHT");
++    if (env != NULL)
++    {
++        m_height = atoi(env);
++        TRACE("forced height=%d", m_height);
++    }
++
++    m_defaultWidth = m_width;
++    m_defaultHeight = m_height;
++
++    env = getenv("HYBRIS_X11_DISABLE_SHM");
++    if (env != NULL)
++    {
++        m_useShm = false;
++        TRACE("won't use MIT-SHM");
++    }
++
++    XGCValues gcvalues;
++    m_gc = XCreateGC(m_display, m_window, 0, &gcvalues);
++
++    m_xcb_gc = xcb_generate_id(m_connection);
++    xcb_create_gc(m_connection, m_xcb_gc, m_window, 0, 0);
++
++    m_specialEvent = 0;
++    m_haveDRIHybris = false;
++    tryEnableDRIHybris();
++
++    m_usage=GRALLOC_USAGE_HW_RENDER | GRALLOC_USAGE_HW_TEXTURE | GRALLOC_USAGE_SW_READ_OFTEN;
++    pthread_mutex_init(&mutex, NULL);
++    pthread_cond_init(&cond, NULL);
++    m_queueReads = 0;
++    m_freeBufs = 0;
++    m_damage_rects = NULL;
++    m_damage_n_rects = 0;
++    m_lastBuffer = 0;
++    setBufferCount(3);
++    HYBRIS_TRACE_END("x11-platform", "create_window", "");
++}
++
++X11NativeWindow::~X11NativeWindow()
++{
++    std::list<X11NativeWindowBuffer *>::iterator it = m_bufList.begin();
++    destroyBuffers();
++}
++
++// overloads from BaseNativeWindow
++int X11NativeWindow::setSwapInterval(int interval) {
++    TRACE("interval:%i", interval);
++
++    if (interval < 0)
++        interval = 0;
++    if (interval > 1)
++        interval = 1;
++
++    HYBRIS_TRACE_BEGIN("x11-platform", "swap_interval", "=%d", interval);
++
++    lock();
++    m_swap_interval = interval;
++    unlock();
++
++    HYBRIS_TRACE_END("x11-platform", "swap_interval", "");
++
++    return 0;
++}
++
++int X11NativeWindow::dequeueBuffer(BaseNativeWindowBuffer **buffer, int *fenceFd){
++    HYBRIS_TRACE_BEGIN("x11-platform", "dequeueBuffer", "");
++
++    X11NativeWindowBuffer *wnb=NULL;
++    TRACE("%p", buffer);
++
++    readQueue(false);
++
++    HYBRIS_TRACE_BEGIN("x11-platform", "dequeueBuffer_wait_for_buffer", "");
++
++    HYBRIS_TRACE_COUNTER("x11-platform", "m_freeBufs", "%i", m_freeBufs);
++
++    while (m_freeBufs == 0) {
++        HYBRIS_TRACE_COUNTER("x11-platform", "m_freeBufs", "%i", m_freeBufs);
++        readQueue(true);
++    }
++
++    lock();
++
++    std::list<X11NativeWindowBuffer *>::iterator it = m_bufList.begin();
++    for (; it != m_bufList.end(); it++)
++    {
++        if ((*it)->busy)
++            continue;
++        if ((*it)->youngest == 1)
++            continue;
++        break;
++    }
++
++    if (it==m_bufList.end()) {
++        HYBRIS_TRACE_BEGIN("x11-platform", "dequeueBuffer_worst_case_scenario", "");
++        HYBRIS_TRACE_END("x11-platform", "dequeueBuffer_worst_case_scenario", "");
++
++        it = m_bufList.begin();
++        for (; it != m_bufList.end() && (*it)->busy; it++)
++        {}
++
++    }
++    if (it==m_bufList.end()) {
++        unlock();
++        HYBRIS_TRACE_BEGIN("x11-platform", "dequeueBuffer_no_free_buffers", "");
++        HYBRIS_TRACE_END("x11-platform", "dequeueBuffer_no_free_buffers", "");
++        TRACE("%p: no free buffers", buffer);
++        return NO_ERROR;
++    }
++
++    wnb = *it;
++    assert(wnb!=NULL);
++    HYBRIS_TRACE_END("x11-platform", "dequeueBuffer_wait_for_buffer", "");
++
++    /* If the buffer doesn't match the window anymore, re-allocate */
++    if (wnb->width != m_width || wnb->height != m_height
++        || wnb->format != m_format || wnb->usage != m_usage)
++    {
++        TRACE("wnb:%p,win:%p %i,%i %i,%i x%x,x%x x%x,x%x",
++            wnb,m_window,
++            wnb->width,m_width, wnb->height,m_height,
++            wnb->format,m_format, wnb->usage,m_usage);
++        destroyBuffer(wnb);
++        m_bufList.erase(it);
++        wnb = addBuffer();
++    }
++
++    wnb->busy = 1;
++    *buffer = wnb;
++    queue.push_back(wnb);
++    --m_freeBufs;
++
++    HYBRIS_TRACE_COUNTER("x11-platform", "m_freeBufs", "%i", m_freeBufs);
++    HYBRIS_TRACE_BEGIN("x11-platform", "dequeueBuffer_gotBuffer", "-%p", wnb);
++    HYBRIS_TRACE_END("x11-platform", "dequeueBuffer_gotBuffer", "-%p", wnb);
++    HYBRIS_TRACE_END("x11-platform", "dequeueBuffer_wait_for_buffer", "");
++
++    unlock();
++    return NO_ERROR;
++}
++
++int X11NativeWindow::lockBuffer(BaseNativeWindowBuffer* buffer){
++    X11NativeWindowBuffer *wnb = (X11NativeWindowBuffer*) buffer;
++    HYBRIS_TRACE_BEGIN("x11-platform", "lockBuffer", "-%p", wnb);
++    HYBRIS_TRACE_END("x11-platform", "lockBuffer", "-%p", wnb);
++    return NO_ERROR;
++}
++
++int X11NativeWindow::readQueue(bool block)
++{
++    int ret = 0;
++
++    if (++m_queueReads == 1) {
++        if (m_specialEvent) {
++            xcb_generic_event_t    *ev;
++
++            if (!block)
++            {
++                while ((ev = xcb_poll_for_special_event(m_connection,
++                                                        m_specialEvent)) != NULL) {
++                    xcb_present_generic_event_t *ge = (xcb_present_generic_event_t *) ev;
++                    handlePresentEvent(ge);
++                }
++            }
++        }
++
++        // all threads waiting on the false branch will wake and return now, so we
++        // can safely set m_queueReads to 0 here instead of relying on every thread
++        // to decrement it. This prevents a race condition when a thread enters readQueue()
++        // before the one in this thread returns.
++        // The new thread would go in the false branch, and there would be no thread in the
++        // true branch, blocking the new thread and any other that will call readQueue in
++        // the future.
++        m_queueReads = 0;
++
++        pthread_cond_broadcast(&cond);
++
++    } else if (block) {
++        while (m_queueReads > 0) {
++            pthread_cond_wait(&cond, &mutex);
++        }
++    }
++
++    return ret;
++}
++
++void X11NativeWindow::prepareSwap(EGLint *damage_rects, EGLint damage_n_rects)
++{
++    lock();
++    m_damage_rects = damage_rects;
++    m_damage_n_rects = damage_n_rects;
++    unlock();
++}
++
++void X11NativeWindow::finishSwap()
++{
++    static int serial = 0;
++    int ret = 0;
++    lock();
++
++    X11NativeWindowBuffer *wnb = queue.front();
++    if (!wnb) {
++        wnb = m_lastBuffer;
++    } else {
++        queue.pop_front();
++    }
++    assert(wnb);
++    m_lastBuffer = wnb;
++    wnb->busy = 1;
++
++    // fronted.push_back(wnb);
++
++    m_damage_rects = NULL;
++    m_damage_n_rects = 0;
++    unlock();
++
++    if (m_haveDRIHybris) {
++        if (wnb->pixmap == 0)
++            wnb->pixmap_from_buffer(m_connection, m_window);
++
++        xcb_present_pixmap(m_connection,
++                            m_window,
++                            wnb->pixmap,
++                            (uint32_t) serial++,
++                            0,                                    /* valid */
++                            0,                                    /* update */
++                            0,                                    /* x_off */
++                            0,                                    /* y_off */
++                            None,                                 /* target_crtc */
++                            None,
++                            XCB_NONE,
++                            XCB_PRESENT_OPTION_NONE,
++                            0,
++                            0,
++                            0, 0, NULL);
++        xcb_flush(m_connection);
++
++        lock();
++
++        ++m_freeBufs;
++        HYBRIS_TRACE_COUNTER("x11-platform", "m_freeBufs", "%i", m_freeBufs);
++
++        std::list<X11NativeWindowBuffer *>::iterator it;
++        for (it = m_bufList.begin(); it != m_bufList.end(); it++)
++        {
++            (*it)->youngest = 0;
++        }
++        wnb->youngest = 1;
++        wnb->busy = 0;
++
++        unlock();
++    } else {
++        copyToX11(wnb);
++    }
++}
++
++static int debugenvchecked = 0;
++
++int X11NativeWindow::queueBuffer(BaseNativeWindowBuffer* buffer, int fenceFd)
++{
++    X11NativeWindowBuffer *wnb = (X11NativeWindowBuffer*) buffer;
++    int ret = 0;
++
++    HYBRIS_TRACE_BEGIN("x11-platform", "queueBuffer", "-%p", wnb);
++    lock();
++
++    if (debugenvchecked == 0)
++    {
++        if (getenv("HYBRIS_WAYLAND_DUMP_BUFFERS") != NULL)
++            debugenvchecked = 2;
++        else
++            debugenvchecked = 1;
++    }
++    if (debugenvchecked == 2)
++    {
++        HYBRIS_TRACE_BEGIN("x11-platform", "queueBuffer_dumping_buffer", "-%p", wnb);
++        hybris_dump_buffer_to_file(wnb->getNativeBuffer());
++        HYBRIS_TRACE_END("x11-platform", "queueBuffer_dumping_buffer", "-%p", wnb);
++
++    }
++
++#if ANDROID_VERSION_MAJOR>=4 && ANDROID_VERSION_MINOR>=2 || ANDROID_VERSION_MAJOR>=5
++    HYBRIS_TRACE_BEGIN("x11-platform", "queueBuffer_waiting_for_fence", "-%p", wnb);
++    if (fenceFd >= 0)
++    {
++        sync_wait(fenceFd, -1);
++        close(fenceFd);
++    }
++    HYBRIS_TRACE_END("x11-platform", "queueBuffer_waiting_for_fence", "-%p", wnb);
++#endif
++
++    HYBRIS_TRACE_COUNTER("x11-platform", "fronted.size", "%i", fronted.size());
++    HYBRIS_TRACE_END("x11-platform", "queueBuffer", "-%p", wnb);
++
++    unlock();
++
++    return NO_ERROR;
++}
++
++int X11NativeWindow::cancelBuffer(BaseNativeWindowBuffer* buffer, int fenceFd){
++    std::list<X11NativeWindowBuffer *>::iterator it;
++    X11NativeWindowBuffer *wnb = (X11NativeWindowBuffer*) buffer;
++
++    lock();
++    HYBRIS_TRACE_BEGIN("x11-platform", "cancelBuffer", "-%p", wnb);
++
++    /* Check first that it really is our buffer */
++    for (it = m_bufList.begin(); it != m_bufList.end(); it++)
++    {
++        if ((*it) == wnb)
++            break;
++    }
++    assert(it != m_bufList.end());
++
++    wnb->busy = 0;
++    ++m_freeBufs;
++    HYBRIS_TRACE_COUNTER("x11-platform", "m_freeBufs", "%i", m_freeBufs);
++
++    for (it = m_bufList.begin(); it != m_bufList.end(); it++)
++    {
++        (*it)->youngest = 0;
++    }
++    wnb->youngest = 1;
++
++    if (m_queueReads != 0) {
++        // Some thread is waiting on wl_display_dispatch_queue(), possibly waiting for a wl_buffer.release
++        // event. Since we have now cancelled a buffer push an artificial event so that the dispatch returns
++        // and the thread can notice the cancelled buffer. This means there is a delay of one roundtrip,
++        // but I don't see other solution except having one dedicated thread for calling wl_display_dispatch_queue().
++        //wl_callback_destroy(wl_display_sync(m_display));
++    }
++
++    HYBRIS_TRACE_END("x11-platform", "cancelBuffer", "-%p", wnb);
++    unlock();
++
++    return 0;
++}
++
++unsigned int X11NativeWindow::width() const {
++    TRACE("value:%i", m_width);
++    return m_width;
++}
++
++unsigned int X11NativeWindow::height() const {
++    TRACE("value:%i", m_height);
++    return m_height;
++}
++
++unsigned int X11NativeWindow::format() const {
++    TRACE("value:%i", m_format);
++    return m_format;
++}
++
++unsigned int X11NativeWindow::defaultWidth() const {
++    TRACE("value:%i", m_defaultWidth);
++    return m_defaultWidth;
++}
++
++unsigned int X11NativeWindow::defaultHeight() const {
++    TRACE("value:%i", m_defaultHeight);
++    return m_defaultHeight;
++}
++
++unsigned int X11NativeWindow::queueLength() const {
++    TRACE("WARN: stub");
++    return 1;
++}
++
++unsigned int X11NativeWindow::type() const {
++    TRACE("");
++#if ANDROID_VERSION_MAJOR>=4 && ANDROID_VERSION_MINOR>=3 || ANDROID_VERSION_MAJOR>=5
++    /* https://android.googlesource.com/platform/system/core/+/bcfa910611b42018db580b3459101c564f802552%5E!/ */
++    return NATIVE_WINDOW_SURFACE;
++#else
++    return NATIVE_WINDOW_SURFACE_TEXTURE_CLIENT;
++#endif
++}
++
++unsigned int X11NativeWindow::transformHint() const {
++    TRACE("WARN: stub");
++    return 0;
++}
++
++/*
++ * returns the current usage of this window
++ */
++unsigned int X11NativeWindow::getUsage() const {
++    return m_usage;
++}
++
++int X11NativeWindow::setBuffersFormat(int format) {
++    /* A 16-bit X visual can only accept RGB565 without conversion. The Mali
++     * UDD may request its preferred 32-bit format after EGL config selection;
++     * pin it to the actual X visual so scanout layout cannot be corrupted. */
++    if (m_depth <= 16)
++        format = HAL_PIXEL_FORMAT_RGB_565;
++    if (format != m_format)
++    {
++        TRACE("old-format:x%x new-format:x%x", m_format, format);
++        m_format = format;
++        /* Buffers will be re-allocated when dequeued */
++    } else {
++        TRACE("format:x%x", format);
++    }
++    return NO_ERROR;
++}
++
++void X11NativeWindow::destroyBuffer(X11NativeWindowBuffer* wnb)
++{
++    TRACE("wnb:%p", wnb);
++
++    assert(wnb != NULL);
++
++    int ret = 0;
++
++    wnb->common.decRef(&wnb->common);
++    m_freeBufs--;
++}
++
++void X11NativeWindow::destroyBuffers()
++{
++    TRACE("");
++
++    std::list<X11NativeWindowBuffer*>::iterator it = m_bufList.begin();
++    for (; it!=m_bufList.end(); ++it)
++    {
++        destroyBuffer(*it);
++        it = m_bufList.erase(it);
++    }
++    m_bufList.clear();
++    m_freeBufs = 0;
++}
++
++X11NativeWindowBuffer *X11NativeWindow::addBuffer() {
++
++    X11NativeWindowBuffer *wnb;
++
++    wnb = new ClientX11Buffer(m_width, m_height, m_format, m_usage, m_depth);
++    m_bufList.push_back(wnb);
++    ++m_freeBufs;
++
++    TRACE("wnb:%p width:%i height:%i format:x%x usage:x%x",
++        wnb, wnb->width, wnb->height, wnb->format, wnb->usage);
++
++    return wnb;
++}
++
++int X11NativeWindow::setBufferCount(int cnt) {
++    int start = 0;
++
++    TRACE("cnt:%d", cnt);
++
++    if (m_bufList.size() == cnt)
++        return NO_ERROR;
++
++    lock();
++
++    if (m_bufList.size() > cnt) {
++        /* Decreasing buffer count, remove from beginning */
++        std::list<X11NativeWindowBuffer*>::iterator it = m_bufList.begin();
++        for (int i = 0; i <= m_bufList.size() - cnt; i++ )
++        {
++            destroyBuffer(*it);
++            ++it;
++            m_bufList.pop_front();
++        }
++
++    } else {
++        /* Increasing buffer count, start from current size */
++        for (int i = m_bufList.size(); i < cnt; i++)
++            X11NativeWindowBuffer *unused = addBuffer();
++
++    }
++
++    unlock();
++
++    return NO_ERROR;
++}
++
++int X11NativeWindow::setBuffersDimensions(int width, int height) {
++    if (m_width != width || m_height != height)
++    {
++        TRACE("old-size:%ix%i new-size:%ix%i", m_width, m_height, width, height);
++        m_width = width;
++        m_height = height;
++        /* Buffers will be re-allocated when dequeued */
++    } else {
++        TRACE("size:%ix%i", width, height);
++    }
++    return NO_ERROR;
++}
++
++int X11NativeWindow::setUsage(int usage) {
++    /* Keep Samsung's requested producer usage unchanged. Adding SW_READ at
++     * allocation time makes Exynos gralloc choose a linear CPU buffer that
++     * Bifrost refuses as a render target. We request CPU read access only
++     * while presenting the completed buffer to X11. */
++    const unsigned int requested = (unsigned int)usage;
++    if (getenv("HYBRIS_WINDOW_DEBUG"))
++        fprintf(stderr, "libhybris-x11: usage old=0x%x requested=0x%x effective=0x%x\n", m_usage, usage, requested);
++    if (requested != m_usage)
++    {
++        m_usage = requested;
++        /* Buffers will be re-allocated when dequeued. */
++    }
++    return NO_ERROR;
++}
++
++void X11NativeWindow::copyToX11(X11NativeWindowBuffer *wnb) {
++    int ret;
++    void *vaddr;
++    std::list<X11NativeWindowBuffer *>::iterator it;
++
++    ret = hybris_gralloc_lock(wnb->handle, GRALLOC_USAGE_SW_READ_OFTEN, 0, 0, wnb->width, wnb->height, &vaddr);
++    TRACE("wnb:%p gralloc lock returns %i", wnb, ret);
++    TRACE("wnb:%p lock to vaddr %p", wnb, vaddr);
++    TRACE("wnb:%p width=%d stride=%d height=%d format=%d", wnb, wnb->width, wnb->stride, wnb->height, wnb->format);
++
++    if (!m_image)
++    {
++        if (m_useShm)
++        {
++            m_image = XShmCreateImage(m_display,
++                        CopyFromParent,
++                        m_depth,
++                        ZPixmap, 0, &m_shminfo, m_width, m_height);
++
++            m_shminfo.shmid = shmget(IPC_PRIVATE,
++                m_image->bytes_per_line * m_image->height,
++                IPC_CREAT|0777);
++
++            m_shminfo.shmaddr = m_image->data = (char *)shmat(m_shminfo.shmid, 0, 0);
++            m_shminfo.readOnly = 0;
++
++            TRACE("m_shminfo.shmaddr %p", m_shminfo.shmaddr);
++
++            XShmAttach(m_display, &m_shminfo);
++        }
++        else
++        {
++            m_image = XCreateImage(m_display,
++                                CopyFromParent,
++                                m_depth,
++                                ZPixmap, 0, (char *)vaddr, m_width, m_height,
++                                m_depth <= 16 ? 16 : 32, 0);
++        }
++    }
++
++
++    if (m_useShm)
++    {
++        const int src_bpp = (wnb->format == HAL_PIXEL_FORMAT_RGB_565) ? 2 : 4;
++        const size_t src_line = (size_t)wnb->stride * src_bpp;
++        const size_t copy_line = src_line < (size_t)m_image->bytes_per_line
++                               ? src_line : (size_t)m_image->bytes_per_line;
++        for (int y = 0; y < m_height; ++y)
++            memcpy(m_image->data + (size_t)y * m_image->bytes_per_line,
++                   (char *)vaddr + (size_t)y * src_line, copy_line);
++        hybris_gralloc_unlock(wnb->handle);
++        XShmPutImage(m_display, m_window, m_gc, m_image, 0, 0, 0, 0, m_width, m_height, 0);
++        /* Do not recycle the single SHM image while Xorg is still reading it. */
++        XSync(m_display, False);
++    }
++    else
++    {
++        m_image->data = (char *)vaddr;
++        XPutImage(m_display, m_window, m_gc, m_image, 0, 0, 0, 0, m_width, m_height);
++        hybris_gralloc_unlock(wnb->handle);
++    }
++
++    lock();
++
++    ++m_freeBufs;
++    HYBRIS_TRACE_COUNTER("x11-platform", "m_freeBufs", "%i", m_freeBufs);
++    for (it = m_bufList.begin(); it != m_bufList.end(); it++)
++    {
++        (*it)->youngest = 0;
++    }
++    wnb->youngest = 1;
++    wnb->busy = 0;
++
++    unlock();
++}
++
++void X11NativeWindow::tryEnableDRIHybris()
++{
++    const xcb_query_extension_reply_t *extension;
++    xcb_void_cookie_t cookie;
++    xcb_generic_error_t *error;
++
++    xcb_prefetch_extension_data (m_connection, &xcb_drihybris_id);
++    xcb_prefetch_extension_data (m_connection, &xcb_present_id);
++
++    extension = xcb_get_extension_data(m_connection, &xcb_drihybris_id);
++    if (!(extension && extension->present))
++        return;
++
++    extension = xcb_get_extension_data(m_connection, &xcb_present_id);
++    if (!(extension && extension->present))
++        return;
++
++    m_specialEventId = xcb_generate_id(m_connection);
++    m_specialEvent = xcb_register_for_special_xge(m_connection,
++                            &xcb_present_id, m_specialEventId, NULL);
++
++    cookie = xcb_present_select_input_checked(m_connection,
++            m_specialEventId, m_window,
++            XCB_PRESENT_EVENT_MASK_COMPLETE_NOTIFY |
++            XCB_PRESENT_EVENT_MASK_CONFIGURE_NOTIFY);
++
++    error = xcb_request_check(m_connection, cookie);
++    if (error) {
++        return;
++    }
++
++    m_haveDRIHybris = true;
++    // HYBRIS_PIXEL_FORMAT_RGBA_8888 is used in glamor for buffer import
++    m_format = HAL_PIXEL_FORMAT_RGBA_8888;
++}
++
++void X11NativeWindow::handlePresentEvent(xcb_present_generic_event_t *ge)
++{
++    switch (ge->evtype) {
++    case XCB_PRESENT_CONFIGURE_NOTIFY: {
++        xcb_present_configure_notify_event_t *ce = (xcb_present_configure_notify_event_t *) ge;
++        printf("XCB_PRESENT_CONFIGURE_NOTIFY: %dx%d\n", ce->width, ce->height);
++        resize(ce->width, ce->height);
++        break;
++    }
++    }
++}
++
++void X11NativeWindowBuffer::pixmap_from_buffer(xcb_connection_t *connection, xcb_drawable_t drawable)
++{
++    int32_t * fds;
++    fds = (int32_t *)calloc(handle->numFds, sizeof(int));
++    for (int i = 0; i < handle->numFds; i++) {
++        fds[i] = dup(handle->data[i]);
++    }
++
++    xcb_drihybris_pixmap_from_buffer_checked(connection,
++                               (pixmap = xcb_generate_id(connection)),
++                               drawable,
++                               stride * height * 4,
++                               this->width, height, stride,
++                               windowDepth, 32,
++                               handle->numInts,
++                               handle->numFds,
++                               (const uint32_t *)(handle->data + handle->numFds),
++                               (const int32_t *)fds);
++    xcb_flush(connection);
++    free(fds);
++}
++
++// vim: noai:ts=4:sw=4:ss=4:expandtab
+diff --git a/hybris/egl/platforms/x11/x11_window.h b/hybris/egl/platforms/x11/x11_window.h
+new file mode 100644
+index 0000000..2d742b2
+--- /dev/null
++++ b/hybris/egl/platforms/x11/x11_window.h
+@@ -0,0 +1,203 @@
++/****************************************************************************************
++ **
++ ** Copyright (C) 2013 Jolla Ltd.
++ ** Contact: Carsten Munk <carsten.munk@jollamobile.com>
++ ** All rights reserved.
++ **
++ ** This file is part of Wayland enablement for libhybris
++ **
++ ** You may use this file under the terms of the GNU Lesser General
++ ** Public License version 2.1 as published by the Free Software Foundation
++ ** and appearing in the file license.lgpl included in the packaging
++ ** of this file.
++ **
++ ** This library is free software; you can redistribute it and/or
++ ** modify it under the terms of the GNU Lesser General Public
++ ** License version 2.1 as published by the Free Software Foundation
++ ** and appearing in the file license.lgpl included in the packaging
++ ** of this file.
++ **
++ ** This library is distributed in the hope that it will be useful,
++ ** but WITHOUT ANY WARRANTY; without even the implied warranty of
++ ** MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
++ ** Lesser General Public License for more details.
++ **
++ ****************************************************************************************/
++
++#ifndef X11_WINDOW_H
++#define X11_WINDOW_H
++#include "nativewindowbase.h"
++#include <linux/fb.h>
++#include <hybris/gralloc/gralloc.h>
++extern "C" {
++#include <X11/Xlib-xcb.h>
++#include <xcb/present.h>
++#include <sys/shm.h>
++#include <X11/extensions/XShm.h>
++#include <pthread.h>
++}
++#include <list>
++#include <deque>
++
++class X11NativeWindowBuffer : public BaseNativeWindowBuffer
++{
++public:
++    X11NativeWindowBuffer() : busy(0), youngest(0), other(0) {}
++    X11NativeWindowBuffer(ANativeWindowBuffer *other)
++    {
++        ANativeWindowBuffer::width = other->width;
++        ANativeWindowBuffer::height = other->height;
++        ANativeWindowBuffer::format = other->format;
++        ANativeWindowBuffer::usage = other->usage;
++#if ANDROID_VERSION_MAJOR>=8
++        ANativeWindowBuffer::usage_deprecated = (int)other->usage;
++        ANativeWindowBuffer::layerCount = other->layerCount ? other->layerCount : 1;
++#endif
++        ANativeWindowBuffer::handle = other->handle;
++        ANativeWindowBuffer::stride = other->stride;
++
++        this->busy = 0;
++        this->other = other;
++        this->youngest = 0;
++        this->pixmap = 0;
++    }
++
++    int busy;
++    int youngest;
++    ANativeWindowBuffer *other;
++    int windowDepth;
++    xcb_pixmap_t pixmap;
++
++    void pixmap_from_buffer(xcb_connection_t *connection, xcb_drawable_t drawable);
++};
++
++class ClientX11Buffer : public X11NativeWindowBuffer
++{
++friend class X11NativeWindow;
++protected:
++    ClientX11Buffer(        unsigned int width,
++                            unsigned int height,
++                            unsigned int format,
++                            unsigned int usage,
++                            unsigned int windowDepth)
++    {
++        // Base members
++        ANativeWindowBuffer::width = width;
++        ANativeWindowBuffer::height = height;
++        ANativeWindowBuffer::format = format;
++        ANativeWindowBuffer::usage = usage;
++#if ANDROID_VERSION_MAJOR>=8
++        ANativeWindowBuffer::usage_deprecated = (int)usage;
++        ANativeWindowBuffer::layerCount = 1;
++#endif
++
++        this->busy = 0;
++        this->other = NULL;
++        int alloc_ok = hybris_gralloc_allocate(this->width ? this->width : 1, this->height ? this->height : 1,
++                this->format, this->usage,
++                &this->handle, (uint32_t*)&this->stride);
++        assert(alloc_ok == 0);
++        this->youngest = 0;
++        this->common.incRef(&this->common);
++
++        this->windowDepth = windowDepth;
++        this->pixmap = 0;
++    }
++
++    ~ClientX11Buffer()
++    {
++        hybris_gralloc_release(this->handle, 1);
++    }
++
++protected:
++    void* vaddr;
++
++public:
++
++};
++
++class X11NativeWindow : public BaseNativeWindow {
++public:
++    X11NativeWindow(Display* xl_display, Window xl_window);
++    ~X11NativeWindow();
++
++    void lock();
++    void unlock();
++    void frame();
++    void resize(unsigned int width, unsigned int height);
++    void releaseBuffer(struct wl_buffer *buffer);
++
++    virtual int setSwapInterval(int interval);
++    void prepareSwap(EGLint *damage_rects, EGLint damage_n_rects);
++    void finishSwap();
++
++protected:
++    // overloads from BaseNativeWindow
++    virtual int dequeueBuffer(BaseNativeWindowBuffer **buffer, int *fenceFd);
++    virtual int lockBuffer(BaseNativeWindowBuffer* buffer);
++    virtual int queueBuffer(BaseNativeWindowBuffer* buffer, int fenceFd);
++    virtual int cancelBuffer(BaseNativeWindowBuffer* buffer, int fenceFd);
++    virtual unsigned int type() const;
++    virtual unsigned int width() const;
++    virtual unsigned int height() const;
++    virtual unsigned int format() const;
++    virtual unsigned int defaultWidth() const;
++    virtual unsigned int defaultHeight() const;
++    virtual unsigned int queueLength() const;
++    virtual unsigned int transformHint() const;
++    virtual unsigned int getUsage() const;
++    // perform calls
++    virtual int setUsage(int usage);
++    virtual int setBuffersFormat(int format);
++    virtual int setBuffersDimensions(int width, int height);
++    virtual int setBufferCount(int cnt);
++
++private:
++    X11NativeWindowBuffer *addBuffer();
++    void destroyBuffer(X11NativeWindowBuffer *);
++    void destroyBuffers();
++    int readQueue(bool block);
++
++    void copyToX11(X11NativeWindowBuffer *wnb);
++    void tryEnableDRIHybris();
++    void handlePresentEvent(xcb_present_generic_event_t *ge);
++
++    std::list<X11NativeWindowBuffer *> m_bufList;
++    std::list<X11NativeWindowBuffer *> fronted;
++    std::list<X11NativeWindowBuffer *> posted;
++    std::list<X11NativeWindowBuffer *> post_registered;
++    std::deque<X11NativeWindowBuffer *> queue;
++
++    Display* m_display;
++    Window m_window;
++    XImage *m_image;
++    XShmSegmentInfo m_shminfo;
++    GC m_gc;
++
++    xcb_connection_t *m_connection;
++    xcb_gcontext_t m_xcb_gc;
++    xcb_present_event_t m_specialEventId;
++    xcb_special_event_t *m_specialEvent;
++
++    bool m_useShm;
++    bool m_haveDRIHybris;
++    
++    X11NativeWindowBuffer *m_lastBuffer;
++    unsigned int m_width;
++    unsigned int m_height;
++    unsigned int m_depth;
++    unsigned int m_format;
++    unsigned int m_defaultWidth;
++    unsigned int m_defaultHeight;
++    unsigned int m_usage;
++
++    pthread_mutex_t mutex;
++    pthread_cond_t cond;
++    int m_queueReads;
++    int m_freeBufs;
++    EGLint *m_damage_rects, m_damage_n_rects;
++    int m_swap_interval;
++};
++
++#endif
++// vim: noai:ts=4:sw=4:ss=4:expandtab
+diff --git a/hybris/egl/platforms/x11/xcb_drihybris.c b/hybris/egl/platforms/x11/xcb_drihybris.c
+new file mode 100644
+index 0000000..bec3722
+--- /dev/null
++++ b/hybris/egl/platforms/x11/xcb_drihybris.c
+@@ -0,0 +1,167 @@
++/*
++ * This file generated automatically from drihybris.xml by c_client.py.
++ * Edit at your peril.
++ */
++
++#include "xcb_drihybris.h"
++#include <stddef.h>  /* for offsetof() */
++
++xcb_extension_t xcb_drihybris_id = { "DRIHYBRIS", 0 };
++
++#define ALIGNOF(type) offsetof(struct { char dummy; type member; }, member)
++
++int
++xcb_drihybris_pixmap_from_buffer_sizeof (const void  *_buffer,
++                                         int32_t      pixmap_fd)
++{
++    char *xcb_tmp = (char *)_buffer;
++    const xcb_drihybris_pixmap_from_buffer_request_t *_aux = (xcb_drihybris_pixmap_from_buffer_request_t *)_buffer;
++    unsigned int xcb_buffer_len = 0;
++    unsigned int xcb_block_len = 0;
++    unsigned int xcb_pad = 0;
++    unsigned int xcb_align_to = 0;
++
++
++    xcb_block_len += sizeof(xcb_drihybris_pixmap_from_buffer_request_t);
++    xcb_tmp += xcb_block_len;
++    xcb_buffer_len += xcb_block_len;
++    xcb_block_len = 0;
++    /* ints */
++    xcb_block_len += _aux->num_ints * sizeof(uint32_t);
++    xcb_tmp += xcb_block_len;
++    xcb_align_to = ALIGNOF(uint32_t);
++    /* insert padding */
++    xcb_pad = -xcb_block_len & (xcb_align_to - 1);
++    xcb_buffer_len += xcb_block_len + xcb_pad;
++    if (0 != xcb_pad) {
++        xcb_tmp += xcb_pad;
++        xcb_pad = 0;
++    }
++    xcb_block_len = 0;
++
++    return xcb_buffer_len;
++}
++
++xcb_void_cookie_t
++xcb_drihybris_pixmap_from_buffer_checked (xcb_connection_t *c,
++                                          xcb_pixmap_t      pixmap,
++                                          xcb_drawable_t    drawable,
++                                          uint32_t          size,
++                                          uint16_t          width,
++                                          uint16_t          height,
++                                          uint16_t          stride,
++                                          uint8_t           depth,
++                                          uint8_t           bpp,
++                                          uint16_t          num_ints,
++                                          uint16_t          num_fds,
++                                          const uint32_t   *ints,
++                                          const int32_t    *fds)
++{
++    static const xcb_protocol_request_t xcb_req = {
++        .count = 4,
++        .ext = &xcb_drihybris_id,
++        .opcode = XCB_DRIHYBRIS_PIXMAP_FROM_BUFFER,
++        .isvoid = 1
++    };
++
++    struct iovec xcb_parts[6];
++    xcb_void_cookie_t xcb_ret;
++    xcb_drihybris_pixmap_from_buffer_request_t xcb_out;
++
++    xcb_out.pixmap = pixmap;
++    xcb_out.drawable = drawable;
++    xcb_out.size = size;
++    xcb_out.width = width;
++    xcb_out.height = height;
++    xcb_out.stride = stride;
++    xcb_out.depth = depth;
++    xcb_out.bpp = bpp;
++    xcb_out.num_ints = num_ints;
++    xcb_out.num_fds = num_fds;
++
++    xcb_parts[2].iov_base = (char *) &xcb_out;
++    xcb_parts[2].iov_len = sizeof(xcb_out);
++    xcb_parts[3].iov_base = 0;
++    xcb_parts[3].iov_len = -xcb_parts[2].iov_len & 3;
++    /* uint32_t ints */
++    xcb_parts[4].iov_base = (char *) ints;
++    xcb_parts[4].iov_len = num_ints * sizeof(uint32_t);
++    xcb_parts[5].iov_base = 0;
++    xcb_parts[5].iov_len = -xcb_parts[4].iov_len & 3;
++
++    xcb_ret.sequence = xcb_send_request_with_fds(c, XCB_REQUEST_CHECKED, xcb_parts + 2, &xcb_req, num_fds, fds);
++    return xcb_ret;
++}
++
++xcb_void_cookie_t
++xcb_drihybris_pixmap_from_buffer (xcb_connection_t *c,
++                                  xcb_pixmap_t      pixmap,
++                                  xcb_drawable_t    drawable,
++                                  uint32_t          size,
++                                  uint16_t          width,
++                                  uint16_t          height,
++                                  uint16_t          stride,
++                                  uint8_t           depth,
++                                  uint8_t           bpp,
++                                  uint16_t          num_ints,
++                                  uint16_t          num_fds,
++                                  const uint32_t   *ints,
++                                  const int32_t    *fds)
++{
++    static const xcb_protocol_request_t xcb_req = {
++        .count = 4,
++        .ext = &xcb_drihybris_id,
++        .opcode = XCB_DRIHYBRIS_PIXMAP_FROM_BUFFER,
++        .isvoid = 1
++    };
++
++    struct iovec xcb_parts[6];
++    xcb_void_cookie_t xcb_ret;
++    xcb_drihybris_pixmap_from_buffer_request_t xcb_out;
++
++    xcb_out.pixmap = pixmap;
++    xcb_out.drawable = drawable;
++    xcb_out.size = size;
++    xcb_out.width = width;
++    xcb_out.height = height;
++    xcb_out.stride = stride;
++    xcb_out.depth = depth;
++    xcb_out.bpp = bpp;
++    xcb_out.num_ints = num_ints;
++    xcb_out.num_fds = num_fds;
++
++    xcb_parts[2].iov_base = (char *) &xcb_out;
++    xcb_parts[2].iov_len = sizeof(xcb_out);
++    xcb_parts[3].iov_base = 0;
++    xcb_parts[3].iov_len = -xcb_parts[2].iov_len & 3;
++    /* uint32_t ints */
++    xcb_parts[4].iov_base = (char *) ints;
++    xcb_parts[4].iov_len = num_ints * sizeof(uint32_t);
++    xcb_parts[5].iov_base = 0;
++    xcb_parts[5].iov_len = -xcb_parts[4].iov_len & 3;
++
++    xcb_ret.sequence = xcb_send_request_with_fds(c, 0, xcb_parts + 2, &xcb_req, num_fds, fds);
++    return xcb_ret;
++}
++
++uint32_t *
++xcb_drihybris_pixmap_from_buffer_ints (const xcb_drihybris_pixmap_from_buffer_request_t *R)
++{
++    return (uint32_t *) (R + 1);
++}
++
++int
++xcb_drihybris_pixmap_from_buffer_ints_length (const xcb_drihybris_pixmap_from_buffer_request_t *R)
++{
++    return R->num_ints;
++}
++
++xcb_generic_iterator_t
++xcb_drihybris_pixmap_from_buffer_ints_end (const xcb_drihybris_pixmap_from_buffer_request_t *R)
++{
++    xcb_generic_iterator_t i;
++    i.data = ((uint32_t *) (R + 1)) + (R->num_ints);
++    i.rem = 0;
++    i.index = (char *) i.data - (char *) R;
++    return i;
++}
+diff --git a/hybris/egl/platforms/x11/xcb_drihybris.h b/hybris/egl/platforms/x11/xcb_drihybris.h
+new file mode 100644
+index 0000000..974828d
+--- /dev/null
++++ b/hybris/egl/platforms/x11/xcb_drihybris.h
+@@ -0,0 +1,122 @@
++/*
++ * This file generated automatically from drihybris.xml by c_client.py.
++ * Edit at your peril.
++ */
++
++/**
++ * @defgroup XCB_DRIHYBRIS_API XCB DRIHYBRIS API
++ * @brief DRIHYBRIS XCB Protocol Implementation.
++ * @{
++ **/
++
++#ifndef DRIHYBRIS_PROTO_H
++#define DRIHYBRIS_PROTO_H
++
++#include <xcb/xcb.h>
++#include <xcb/xcbext.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define XCB_DRIHYBRIS_MAJOR_VERSION 1
++#define XCB_DRIHYBRIS_MINOR_VERSION 0
++
++extern xcb_extension_t xcb_drihybris_id;
++
++/** Opcode for xcb_drihybris_pixmap_from_buffer. */
++#define XCB_DRIHYBRIS_PIXMAP_FROM_BUFFER 1
++
++/**
++ * @brief xcb_drihybris_pixmap_from_buffer_request_t
++ **/
++typedef struct xcb_drihybris_pixmap_from_buffer_request_t {
++    uint8_t        major_opcode;
++    uint8_t        minor_opcode;
++    uint16_t       length;
++    xcb_pixmap_t   pixmap;
++    xcb_drawable_t drawable;
++    uint32_t       size;
++    uint16_t       width;
++    uint16_t       height;
++    uint16_t       stride;
++    uint8_t        depth;
++    uint8_t        bpp;
++    uint16_t       num_ints;
++    uint16_t       num_fds;
++} xcb_drihybris_pixmap_from_buffer_request_t;
++
++/**
++ * @brief xcb_drihybris_buffer_from_pixmap_cookie_t
++ **/
++typedef struct xcb_drihybris_buffer_from_pixmap_cookie_t {
++    unsigned int sequence;
++} xcb_drihybris_buffer_from_pixmap_cookie_t;
++
++int
++xcb_drihybris_pixmap_from_buffer_sizeof (const void  *_buffer,
++                                         int32_t      pixmap_fd);
++
++/**
++ *
++ * @param c The connection
++ * @return A cookie
++ *
++ * Delivers a request to the X server.
++ *
++ * This form can be used only if the request will not cause
++ * a reply to be generated. Any returned error will be
++ * saved for handling by xcb_request_check().
++ */
++xcb_void_cookie_t
++xcb_drihybris_pixmap_from_buffer_checked (xcb_connection_t *c,
++                                          xcb_pixmap_t      pixmap,
++                                          xcb_drawable_t    drawable,
++                                          uint32_t          size,
++                                          uint16_t          width,
++                                          uint16_t          height,
++                                          uint16_t          stride,
++                                          uint8_t           depth,
++                                          uint8_t           bpp,
++                                          uint16_t          num_ints,
++                                          uint16_t          num_fds,
++                                          const uint32_t   *ints,
++                                          const int32_t    *fds);
++
++/**
++ *
++ * @param c The connection
++ * @return A cookie
++ *
++ * Delivers a request to the X server.
++ *
++ */
++xcb_void_cookie_t
++xcb_drihybris_pixmap_from_buffer (xcb_connection_t *c,
++                                  xcb_pixmap_t      pixmap,
++                                  xcb_drawable_t    drawable,
++                                  uint32_t          size,
++                                  uint16_t          width,
++                                  uint16_t          height,
++                                  uint16_t          stride,
++                                  uint8_t           depth,
++                                  uint8_t           bpp,
++                                  uint16_t          num_ints,
++                                  uint16_t          num_fds,
++                                  const uint32_t   *ints,
++                                  const int32_t    *fds);
++
++uint32_t *
++xcb_drihybris_pixmap_from_buffer_ints (const xcb_drihybris_pixmap_from_buffer_request_t *R);
++
++int
++xcb_drihybris_pixmap_from_buffer_ints_length (const xcb_drihybris_pixmap_from_buffer_request_t *R);
++
++xcb_generic_iterator_t
++xcb_drihybris_pixmap_from_buffer_ints_end (const xcb_drihybris_pixmap_from_buffer_request_t *R);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif //DRIHYBRIS_PROTO_H
