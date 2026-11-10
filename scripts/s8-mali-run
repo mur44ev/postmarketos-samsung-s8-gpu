@@ -1,18 +1,39 @@
 #!/bin/sh
+# Run an EGL/GLES program through the patched libhybris on the Galaxy S8.
+#
+#   s8-mali-run <program> [args...]
+#
+# Environment overrides:
+#   LIBHYBRIS_PREFIX  where build-libhybris.sh installed  (default /opt/libhybris-s8)
+#   ANDROID_SYSTEM    read-only mount of the stock SYSTEM (default /mnt/android-system)
 set -eu
 
-[ -r /mnt/android-system/vendor/lib64/egl/libGLES_mali.so ] || {
-    echo "s8-mali-run: Android SYSTEM is not mounted" >&2
-    exit 1
-}
-[ -r /dev/mali0 ] && [ -r /dev/ion ] || {
-    echo "s8-mali-run: current user needs video-group access to mali0 and ion" >&2
+prefix=${LIBHYBRIS_PREFIX:-/opt/libhybris-s8}
+android=${ANDROID_SYSTEM:-/mnt/android-system}
+
+fail() {
+    echo "s8-mali-run: $*" >&2
     exit 1
 }
 
-export HYBRIS_LD_LIBRARY_PATH=/mnt/android-system/vendor/lib64:/mnt/android-system/lib64
+if [ $# -lt 1 ] || [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
+    echo "usage: s8-mali-run <program> [args...]" >&2
+    exit 2
+fi
+
+[ -r "$android/vendor/lib64/egl/libGLES_mali.so" ] || fail "Android SYSTEM is not mounted at $android"
+[ -r "$prefix/lib/libEGL.so.1" ] || fail "patched libhybris is not installed under $prefix"
+[ -r "$prefix/lib/libhybris/eglplatform_x11.so" ] || fail "libhybris under $prefix was built without --enable-x11"
+for dev in /dev/mali0 /dev/ion; do
+    # Mali opens both nodes read-write, so -r alone is not enough.
+    if ! [ -r "$dev" ] || ! [ -w "$dev" ]; then
+        fail "$dev is not readable and writable; add this user to the video group"
+    fi
+done
+
+export HYBRIS_LD_LIBRARY_PATH="$android/vendor/lib64:$android/lib64"
 export HYBRIS_EGLPLATFORM=x11
-export HYBRIS_EGLPLATFORM_DIR=/opt/libhybris-s8/lib/libhybris
+export HYBRIS_EGLPLATFORM_DIR="$prefix/lib/libhybris"
 export HYBRIS_ANDROID_SDK_VERSION=28
 export HYBRIS_FORCE_LEGACY_PROPERTIES=1
 export HYBRIS_GRALLOC1_RELEASE_IMPLY_DELETE=1
@@ -20,6 +41,6 @@ export HYBRIS_PTHREAD_KEY_ZERO_VALID=1
 export LIBEGL=libGLES_mali.so
 export LIBGLESV2=libGLES_mali.so
 export LIBGLESV1=libGLES_mali.so
-export LD_LIBRARY_PATH=/opt/libhybris-s8/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+export LD_LIBRARY_PATH="$prefix/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 exec "$@"

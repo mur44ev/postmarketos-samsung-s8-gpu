@@ -24,6 +24,7 @@ class BufferCleanupTest(unittest.TestCase):
         harness = directory / "cleanup.cpp"
         harness.write_text(r'''
 #include <cstdlib>
+#include <deque>
 #include <iostream>
 #include <list>
 #include <vector>
@@ -31,6 +32,8 @@ class BufferCleanupTest(unittest.TestCase):
 struct X11NativeWindowBuffer { int releases = 0; };
 struct X11NativeWindow {
     std::list<X11NativeWindowBuffer*> m_bufList;
+    std::deque<X11NativeWindowBuffer*> queue;
+    X11NativeWindowBuffer *m_lastBuffer = NULL;
     int m_freeBufs = 0;
     void destroyBuffer(X11NativeWindowBuffer *buffer) {
         ++buffer->releases;
@@ -44,9 +47,17 @@ int main(int argc, char **argv) {
     std::vector<X11NativeWindowBuffer> buffers(std::atoi(argv[1]));
     X11NativeWindow window;
     for (auto &buffer : buffers) window.m_bufList.push_back(&buffer);
+    if (!buffers.empty()) {
+        window.queue.push_back(&buffers.front());
+        window.m_lastBuffer = &buffers.back();
+    }
     window.m_freeBufs = buffers.size();
     window.destroyBuffers();
     if (!window.m_bufList.empty() || window.m_freeBufs != 0) return 1;
+    if (!window.queue.empty() || window.m_lastBuffer != NULL) {
+        std::cerr << "stale buffer references survived destroyBuffers()\n";
+        return 1;
+    }
     for (const auto &buffer : buffers) {
         if (buffer.releases != 1) {
             std::cerr << "buffer released " << buffer.releases << " times, expected 1\n";

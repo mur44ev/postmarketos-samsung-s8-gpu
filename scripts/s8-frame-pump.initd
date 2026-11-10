@@ -1,0 +1,20 @@
+#!/sbin/openrc-run
+
+name="S8 frame pump"
+description="Commit the fb0 pan at the panel refresh rate so Samsung DECON keeps presenting frames"
+
+command="/usr/local/bin/s8-frame-pump"
+command_args="${S8_FRAME_PUMP_HZ:-60}"
+command_background="yes"
+pidfile="/run/s8-frame-pump.pid"
+
+depend() {
+    need localmount
+}
+
+start_pre() {
+    if [ ! -w /sys/class/graphics/fb0/pan ]; then
+        eerror "/sys/class/graphics/fb0/pan is not writable"
+        return 1
+    fi
+}

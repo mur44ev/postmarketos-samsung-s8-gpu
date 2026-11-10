@@ -4,6 +4,9 @@
 *.ko
 *.tar*
 *.log
-core*
+core
+core.[0-9]*
 .env
 secrets/
+scripts/s8-frame-pump
+__pycache__/
