@@ -15,6 +15,7 @@ jobs:
       - run: shellcheck -s sh -e SC2034 scripts/s8-frame-pump.initd
       - run: make -C scripts CFLAGS="-O2 -std=c99 -Wall -Wextra -Wpedantic -Werror"
       - run: scripts/s8-frame-pump --help
+      - run: python3 -m unittest discover -s tests -v
 
   patch-applies:
     name: Patch applies to the pinned libhybris commit
