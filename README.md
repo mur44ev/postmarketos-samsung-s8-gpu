@@ -29,3 +29,10 @@
 - Internal ABOX audio is not part of this GPU fix; the archived driver rejects the available Calliope firmware.
 
 Full measured evidence: [`evidence/known-good.txt`](evidence/known-good.txt).
+
+## Tests
+
+Run `python3 -m unittest discover -s tests -v` with Python 3 and a C++11 compiler
+using libstdc++ (`c++` by default, or set `CXX`). The hardware-free cleanup
+regression compiles the method directly from the shipped patch and enables
+libstdc++ iterator checks; Android blobs and a running X server are not required.
