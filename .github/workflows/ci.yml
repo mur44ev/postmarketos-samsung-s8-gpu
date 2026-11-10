@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  scripts:
+    name: Lint scripts and build the frame pump
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends shellcheck
+      - run: shellcheck -s sh scripts/s8-mali-run scripts/build-libhybris.sh scripts/verify-stock-inputs.sh
+      - run: shellcheck -s sh -e SC2034 scripts/s8-frame-pump.initd
+      - run: make -C scripts CFLAGS="-O2 -std=c99 -Wall -Wextra -Wpedantic -Werror"
+      - run: scripts/s8-frame-pump --help
+
+  patch-applies:
+    name: Patch applies to the pinned libhybris commit
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: git clone https://github.com/libhybris/libhybris.git /tmp/libhybris
+      - run: git -C /tmp/libhybris checkout --detach 60100a70f03d91224340d0b7e741e6f44e0f9618
+      - run: git -C /tmp/libhybris apply --check --whitespace=error "$GITHUB_WORKSPACE/patches/libhybris-android9-musl-x11.patch"
+
+  libhybris-aarch64-musl:
+    # Native AArch64 build of the patched libhybris on Alpine (musl), i.e. the
+    # same toolchain family as postmarketOS on the phone.
+    name: Build patched libhybris (aarch64, musl)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build inside Alpine
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src alpine:3.21 sh -ec '
+            apk add --no-cache build-base autoconf automake libtool pkgconf linux-headers \
+              bsd-compat-headers git patch libx11-dev libxcb-dev libxext-dev
+            git clone --depth 1 -b halium-9.0 https://github.com/Halium/android-headers.git /tmp/android-headers
+            ANDROID_HEADERS=/tmp/android-headers DESTDIR=/tmp/stage JOBS="$(nproc)" \
+              scripts/build-libhybris.sh /tmp/libhybris
+            ls -l /tmp/stage/opt/libhybris-s8/lib/libEGL.so.1 \
+                  /tmp/stage/opt/libhybris-s8/lib/libhybris/eglplatform_x11.so
+          '

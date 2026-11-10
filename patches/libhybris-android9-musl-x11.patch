@@ -1,5 +1,27 @@
+libhybris: Android 9 / musl / X11 support for the Samsung Galaxy S8 (Exynos 8895, Mali-G71)
+
+Base: https://github.com/libhybris/libhybris commit 60100a70f03d91224340d0b7e741e6f44e0f9618
+      ("hybris: gles: Add wrappers for OpenGL ES 3.1 and 3.2", 2020-04-29)
+
+Apply from the libhybris checkout root:
+    git apply --check libhybris-android9-musl-x11.patch && git apply libhybris-android9-musl-x11.patch
+then configure in hybris/ with --enable-x11 (see scripts/build-libhybris.sh).
+
+Contents:
+  * musl compatibility for hooks, properties and the mm/n/o Android linkers
+    (based on postmarketOS' "Make libhybris compile with musl"; adds the
+    hybris/include/hybris/common/musl_compat.h shim it relies on).
+  * HYBRIS_PTHREAD_KEY_ZERO_VALID, HYBRIS_FORCE_LEGACY_PROPERTIES and
+    HYBRIS_GRALLOC1_RELEASE_IMPLY_DELETE opt-in quirks for Samsung's blobs.
+  * Android 9 ANativeWindow operations (SET_USAGE64, GET_CONSUMER_USAGE64,
+    MAX_BUFFER_COUNT) and HYBRIS_WINDOW_DEBUG tracing.
+  * X11 EGL platform (--enable-x11): gralloc buffers presented through
+    DRI-hybris/Present when available, otherwise MIT-SHM/XPutImage copies.
+  * eglGetConfigAttrib routed through the platform so EGL_NATIVE_VISUAL_ID
+    matches the X visual.
+
 diff --git a/hybris/common/hooks.c b/hybris/common/hooks.c
-index 2292a32..317fa4b 100644
+index 2292a32..520d7e1 100644
 --- a/hybris/common/hooks.c
 +++ b/hybris/common/hooks.c
 @@ -80,6 +80,10 @@ extern int my_property_list(void (*propfn)(const char *key, const char *value, v
@@ -13,7 +35,7 @@ index 2292a32..317fa4b 100644
  #include <android-config.h>
  
  // this is also used in bionic:
-@@ -418,8 +422,11 @@ static void* _hybris_hook_pthread_getspecific(pthread_key_t key)
+@@ -418,8 +422,18 @@ static void* _hybris_hook_pthread_getspecific(pthread_key_t key)
  {
      TRACE_HOOK("key %d", key);
  
@@ -23,11 +45,18 @@ index 2292a32..317fa4b 100644
 +    // pthread_key_create can legitimately allocate key zero. Samsung's Mali
 +    // EGL uses that first key for its per-thread current display/context data.
 +    // Opt in to host key-zero semantics for such blobs instead of discarding it.
-+    if (!key && !getenv("HYBRIS_PTHREAD_KEY_ZERO_VALID")) return NULL;
++    // This hook sits on the GL call hot path, so the environment is read once.
++    if (!key) {
++        static int key_zero_valid = -1;
++        if (key_zero_valid < 0)
++            key_zero_valid = getenv("HYBRIS_PTHREAD_KEY_ZERO_VALID") != NULL;
++        if (!key_zero_valid)
++            return NULL;
++    }
  
      return pthread_getspecific(key);
  }
-@@ -531,6 +538,7 @@ static int _hybris_hook_pthread_attr_getstacksize(pthread_attr_t const *__attr,
+@@ -531,6 +545,7 @@ static int _hybris_hook_pthread_attr_getstacksize(pthread_attr_t const *__attr,
      return pthread_attr_getstacksize(realattr, stack_size);
  }
  
@@ -35,7 +64,7 @@ index 2292a32..317fa4b 100644
  static int _hybris_hook_pthread_attr_setstackaddr(pthread_attr_t *__attr, void *stack_addr)
  {
      pthread_attr_t *realattr = (pthread_attr_t *) *(uintptr_t *) __attr;
-@@ -548,6 +556,7 @@ static int _hybris_hook_pthread_attr_getstackaddr(pthread_attr_t const *__attr,
+@@ -548,6 +563,7 @@ static int _hybris_hook_pthread_attr_getstackaddr(pthread_attr_t const *__attr,
  
      return pthread_attr_getstackaddr(realattr, stack_addr);
  }
@@ -43,7 +72,7 @@ index 2292a32..317fa4b 100644
  
  static int _hybris_hook_pthread_attr_setstack(pthread_attr_t *__attr, void *stack_base, size_t stack_size)
  {
-@@ -1134,6 +1143,7 @@ static int _hybris_hook_pthread_rwlockattr_getpshared(pthread_rwlockattr_t *__at
+@@ -1134,6 +1150,7 @@ static int _hybris_hook_pthread_rwlockattr_getpshared(pthread_rwlockattr_t *__at
      return pthread_rwlockattr_getpshared(realattr, pshared);
  }
  
@@ -51,7 +80,7 @@ index 2292a32..317fa4b 100644
  int _hybris_hook_pthread_rwlockattr_setkind_np(pthread_rwlockattr_t *attr, int pref)
  {
      pthread_rwlockattr_t *realattr = (pthread_rwlockattr_t *) *(uintptr_t *) attr;
-@@ -1151,6 +1161,7 @@ int _hybris_hook_pthread_rwlockattr_getkind_np(const pthread_rwlockattr_t *attr,
+@@ -1151,6 +1168,7 @@ int _hybris_hook_pthread_rwlockattr_getkind_np(const pthread_rwlockattr_t *attr,
  
      return pthread_rwlockattr_getkind_np(realattr, pref);
  }
@@ -59,7 +88,7 @@ index 2292a32..317fa4b 100644
  
  /*
   * pthread_rwlock_* functions
-@@ -1500,10 +1511,14 @@ static int _hybris_hook_fgetpos(FILE *fp, bionic_fpos_t *pos)
+@@ -1500,10 +1518,14 @@ static int _hybris_hook_fgetpos(FILE *fp, bionic_fpos_t *pos)
  {
      TRACE_HOOK("fp %p pos %p", fp, pos);
  
@@ -74,7 +103,7 @@ index 2292a32..317fa4b 100644
  
      return ret;
  }
-@@ -1589,12 +1604,16 @@ static int _hybris_hook_fsetpos(FILE *fp, const bionic_fpos_t *pos)
+@@ -1589,12 +1611,16 @@ static int _hybris_hook_fsetpos(FILE *fp, const bionic_fpos_t *pos)
  {
      TRACE_HOOK("fp %p pos %p", fp, pos);
  
@@ -91,7 +120,7 @@ index 2292a32..317fa4b 100644
  }
  
  static long _hybris_hook_ftell(FILE *fp)
-@@ -1872,6 +1891,7 @@ static int _hybris_hook_versionsort(struct bionic_dirent **a,
+@@ -1872,6 +1898,7 @@ static int _hybris_hook_versionsort(struct bionic_dirent **a,
      return strverscmp((*a)->d_name, (*b)->d_name);
  }
  
@@ -99,7 +128,7 @@ index 2292a32..317fa4b 100644
  static int _hybris_hook_scandirat(int fd, const char *dir,
                        struct bionic_dirent ***namelist,
                        int (*filter) (const struct bionic_dirent *),
-@@ -1933,6 +1953,7 @@ static int _hybris_hook_scandir(const char *dir,
+@@ -1933,6 +1960,7 @@ static int _hybris_hook_scandir(const char *dir,
  {
      return _hybris_hook_scandirat(AT_FDCWD, dir, namelist, filter, compar);
  }
@@ -107,7 +136,7 @@ index 2292a32..317fa4b 100644
  
  static inline void swap(void **a, void **b)
  {
-@@ -2190,6 +2211,7 @@ int _hybris_hook_open(const char *pathname, int flags, ...)
+@@ -2190,6 +2218,7 @@ int _hybris_hook_open(const char *pathname, int flags, ...)
      return open(target_path, flags, mode);
  }
  
@@ -115,7 +144,7 @@ index 2292a32..317fa4b 100644
  /**
   * Wrap some GCC builtin functions, which don't have any address
   */
-@@ -2215,6 +2237,7 @@ __THROW int _hybris_hook___snprintf_chk (char *__restrict __s, size_t __n, int _
+@@ -2215,6 +2244,7 @@ __THROW int _hybris_hook___snprintf_chk (char *__restrict __s, size_t __n, int _
  
      return ret;
  }
@@ -123,7 +152,7 @@ index 2292a32..317fa4b 100644
  
  static __thread void *tls_hooks[16];
  
-@@ -2360,6 +2383,15 @@ static char* _hybris_hook_setlocale(int category, const char *locale)
+@@ -2360,6 +2390,15 @@ static char* _hybris_hook_setlocale(int category, const char *locale)
      return setlocale(category, locale);
  }
  
@@ -139,7 +168,7 @@ index 2292a32..317fa4b 100644
  static void* _hybris_hook_mmap(void *addr, size_t len, int prot,
                    int flags, int fd, off_t offset)
  {
-@@ -2375,6 +2407,7 @@ static int _hybris_hook_munmap(void *addr, size_t length)
+@@ -2375,6 +2414,7 @@ static int _hybris_hook_munmap(void *addr, size_t length)
  
      return munmap(addr, length);
  }
@@ -147,7 +176,7 @@ index 2292a32..317fa4b 100644
  
  extern size_t strlcat(char *dst, const char *src, size_t siz);
  extern size_t strlcpy(char *dst, const char *src, size_t siz);
-@@ -2695,7 +2728,9 @@ static struct _hook hooks_common[] = {
+@@ -2695,7 +2735,9 @@ static struct _hook hooks_common[] = {
      HOOK_DIRECT_NO_DEBUG(realloc),
      HOOK_DIRECT_NO_DEBUG(memalign),
      HOOK_DIRECT_NO_DEBUG(valloc),
@@ -157,7 +186,7 @@ index 2292a32..317fa4b 100644
      HOOK_DIRECT(fread),
      HOOK_DIRECT_NO_DEBUG(getxattr),
      HOOK_DIRECT(mprotect),
-@@ -2745,8 +2780,10 @@ static struct _hook hooks_common[] = {
+@@ -2745,8 +2787,10 @@ static struct _hook hooks_common[] = {
      HOOK_DIRECT_NO_DEBUG(bcopy),
      HOOK_DIRECT_NO_DEBUG(bzero),
      HOOK_DIRECT_NO_DEBUG(ffs),
@@ -168,7 +197,7 @@ index 2292a32..317fa4b 100644
      /* pthread.h */
      HOOK_DIRECT_NO_DEBUG(getauxval),
      HOOK_INDIRECT(gettid),
-@@ -2805,8 +2842,10 @@ static struct _hook hooks_common[] = {
+@@ -2805,8 +2849,10 @@ static struct _hook hooks_common[] = {
      HOOK_INDIRECT(pthread_attr_getschedparam),
      HOOK_INDIRECT(pthread_attr_setstacksize),
      HOOK_INDIRECT(pthread_attr_getstacksize),
@@ -179,7 +208,7 @@ index 2292a32..317fa4b 100644
      HOOK_INDIRECT(pthread_attr_setstack),
      HOOK_INDIRECT(pthread_attr_getstack),
      HOOK_INDIRECT(pthread_attr_setguardsize),
-@@ -2928,8 +2967,10 @@ static struct _hook hooks_common[] = {
+@@ -2928,8 +2974,10 @@ static struct _hook hooks_common[] = {
      HOOK_DIRECT_NO_DEBUG(seekdir),
      HOOK_DIRECT_NO_DEBUG(telldir),
      HOOK_DIRECT_NO_DEBUG(dirfd),
@@ -190,7 +219,7 @@ index 2292a32..317fa4b 100644
      HOOK_INDIRECT(alphasort),
      HOOK_INDIRECT(versionsort),
      /* fcntl.h */
-@@ -2953,7 +2994,9 @@ static struct _hook hooks_common[] = {
+@@ -2953,7 +3001,9 @@ static struct _hook hooks_common[] = {
      HOOK_DIRECT_NO_DEBUG(localtime_r),
      HOOK_DIRECT_NO_DEBUG(gmtime),
      HOOK_DIRECT_NO_DEBUG(abort),
@@ -200,7 +229,7 @@ index 2292a32..317fa4b 100644
      /* unistd.h */
      HOOK_DIRECT_NO_DEBUG(access),
      /* grp.h */
-@@ -2983,13 +3026,17 @@ static struct _hook hooks_mm[] = {
+@@ -2983,13 +3033,17 @@ static struct _hook hooks_mm[] = {
      HOOK_DIRECT(putenv),
      HOOK_DIRECT(clearenv),
      HOOK_DIRECT_NO_DEBUG(dprintf),
@@ -218,7 +247,7 @@ index 2292a32..317fa4b 100644
      /* unistd.h */
      HOOK_DIRECT(fork),
      HOOK_DIRECT_NO_DEBUG(ttyname),
-@@ -3010,16 +3057,23 @@ static struct _hook hooks_mm[] = {
+@@ -3010,16 +3064,23 @@ static struct _hook hooks_mm[] = {
      HOOK_DIRECT(uselocale),
      HOOK_DIRECT(localeconv),
      HOOK_DIRECT(setlocale),
@@ -242,7 +271,7 @@ index 2292a32..317fa4b 100644
      HOOK_INDIRECT(fputws),
      // It's enough to hook vfwprintf here as fwprintf will call it with a
      // proper va_list in place so we don't have to handle this here.
-@@ -3073,9 +3127,11 @@ static struct _hook hooks_mm[] = {
+@@ -3073,9 +3134,11 @@ static struct _hook hooks_mm[] = {
      /* dirent.h */
      HOOK_TO(readdir64, _hybris_hook_readdir),
      HOOK_TO(readdir64_r, _hybris_hook_readdir_r),
@@ -254,21 +283,42 @@ index 2292a32..317fa4b 100644
  };
  
  
-@@ -3199,7 +3255,7 @@ static void* __hybris_get_hooked_symbol(const char *sym, const char *requester)
+@@ -3159,6 +3222,20 @@ static int get_android_sdk_version()
+     return sdk_version;
+ }
+ 
++/* Android 8+ blobs normally get their properties from bionic libc. Some
++ * vendor trees (Samsung Android 9) still need the libhybris property hooks;
++ * HYBRIS_FORCE_LEGACY_PROPERTIES opts in. Evaluated once, it is consulted for
++ * every symbol lookup. */
++static int use_legacy_properties(int sdk_version)
++{
++    static int forced = -1;
++
++    if (forced < 0)
++        forced = getenv("HYBRIS_FORCE_LEGACY_PROPERTIES") != NULL;
++
++    return sdk_version < 27 || forced;
++}
++
+ #define HOOKS_SIZE(hooks) \
+     (sizeof(hooks) / sizeof(hooks[0]))
+ 
+@@ -3199,7 +3276,7 @@ static void* __hybris_get_hooked_symbol(const char *sym, const char *requester)
      // make sure to skip the property hooks only when o.so is actually loaded
      // since for testing and we sometimes set things like 99 as sdk version.
      // The o linker is loaded when sdk_version >= 27 and exists.
 -    if (!found && sdk_version < 27)
-+    if (!found && (sdk_version < 27 || getenv("HYBRIS_FORCE_LEGACY_PROPERTIES")))
++    if (!found && use_legacy_properties(sdk_version))
          found = bsearch(&key, hooks_properties, HOOKS_SIZE(hooks_properties), sizeof(hooks_properties[0]), hook_cmp);
  
      if (!found)
-@@ -3372,7 +3428,7 @@ void* android_dlsym(void* handle, const char* symbol)
+@@ -3372,7 +3449,7 @@ void* android_dlsym(void* handle, const char* symbol)
      ENSURE_LINKER_IS_LOADED();
  
      // do not use hybris properties for older linkers
 -    if (get_android_sdk_version() < 27) {
-+    if (get_android_sdk_version() < 27 || getenv("HYBRIS_FORCE_LEGACY_PROPERTIES")) {
++    if (use_legacy_properties(get_android_sdk_version())) {
          if (!strcmp(symbol, "property_list")) {
              return my_property_list;
          }
@@ -659,10 +709,26 @@ index 2e10383..77a0919 100644
 +
  #endif
 diff --git a/hybris/configure.ac b/hybris/configure.ac
-index 2bf69a9..b088857 100644
+index cc5e45f..27dcf86 100644
 --- a/hybris/configure.ac
 +++ b/hybris/configure.ac
-@@ -271,6 +271,7 @@ AC_CONFIG_FILES([
+@@ -91,6 +91,15 @@ AC_ARG_ENABLE(wayland,
+   [wayland="no"])
+ AM_CONDITIONAL( [WANT_WAYLAND], [test x"$wayland" = x"yes"])
+ 
++AC_ARG_ENABLE(x11,
++  [  --enable-x11                Enable X11 EGL platform (default=disabled)],
++  [x11=$enableval
++	PKG_CHECK_MODULES(X11, [x11 x11-xcb xcb xcb-present xext],, exit)
++	AC_DEFINE(WANT_X11, [], [We want X11 support])
++],
++  [x11="no"])
++AM_CONDITIONAL( [WANT_X11], [test x"$x11" = x"yes"])
++
+ AC_ARG_ENABLE(wayland_serverside_buffers,
+   [  --enable-wayland_serverside_buffers            Enable serverside buffer allocation for wayland (default=enabled)],
+   [wayland_serverside_buffers=$enableval],
+@@ -271,6 +280,7 @@ AC_CONFIG_FILES([
  	egl/platforms/null/Makefile
  	egl/platforms/fbdev/Makefile
  	egl/platforms/wayland/Makefile
@@ -671,7 +737,7 @@ index 2bf69a9..b088857 100644
  	egl/platforms/hwcomposer/hwcomposer-egl.pc
  	glesv1/glesv1_cm.pc
 diff --git a/hybris/egl/egl.c b/hybris/egl/egl.c
-index f6dcd09..4da4128 100644
+index c849de5..34a9cb9 100644
 --- a/hybris/egl/egl.c
 +++ b/hybris/egl/egl.c
 @@ -228,7 +228,6 @@ const char * eglQueryString(EGLDisplay dpy, EGLint name)
@@ -693,7 +759,7 @@ index f6dcd09..4da4128 100644
  		ws_finishSwap(dpy, win);
  	} else {
  		ret = (*_eglSwapBuffers)(dpy, surface);
-@@ -461,4 +464,16 @@ EGLBoolean eglDestroyImageKHR(EGLDisplay dpy, EGLImageKHR image)
+@@ -459,4 +462,16 @@ EGLBoolean eglDestroyImageKHR(EGLDisplay dpy, EGLImageKHR image)
  	return ret;
  }
  
@@ -702,26 +768,28 @@ index f6dcd09..4da4128 100644
 +	HYBRIS_DLSYSM(egl, &_eglGetConfigAttrib, "eglGetConfigAttrib");
 +	struct _EGLDisplay *display = hybris_egl_display_get_mapping(dpy);
 +
-+    EGLBoolean ret = ws_eglGetConfigAttrib(display, config, attribute, value);
-+    if (ret == EGL_FALSE) {
-+        return (*_eglGetConfigAttrib)(dpy, config, attribute, value);
-+    }
-+    return ret;
++	/* Platforms may translate attributes such as EGL_NATIVE_VISUAL_ID;
++	 * anything they do not handle comes from the Android EGL driver. */
++	if (display && ws_eglGetConfigAttrib(display, config, attribute, value))
++		return EGL_TRUE;
++	return (*_eglGetConfigAttrib)(dpy, config, attribute, value);
 +}
 +
  // vim:ts=4:sw=4:noexpandtab
 diff --git a/hybris/egl/platforms/Makefile.am b/hybris/egl/platforms/Makefile.am
-index 4126752..c52de15 100644
+index 4126752..0def454 100644
 --- a/hybris/egl/platforms/Makefile.am
 +++ b/hybris/egl/platforms/Makefile.am
-@@ -11,4 +11,4 @@ if WANT_WAYLAND
+@@ -11,4 +11,6 @@ if WANT_WAYLAND
  SUBDIRS += wayland
  endif
  
 -
++if WANT_X11
 +SUBDIRS += x11
++endif
 diff --git a/hybris/egl/platforms/common/nativewindowbase.cpp b/hybris/egl/platforms/common/nativewindowbase.cpp
-index 73775b7..79fcad9 100644
+index 73775b7..57c47a7 100644
 --- a/hybris/egl/platforms/common/nativewindowbase.cpp
 +++ b/hybris/egl/platforms/common/nativewindowbase.cpp
 @@ -7,6 +7,8 @@
@@ -733,7 +801,24 @@ index 73775b7..79fcad9 100644
  #include <system/window.h>
  #include <system/graphics.h>
  #include <hardware/gralloc.h>
-@@ -44,6 +46,12 @@ BaseNativeWindowBuffer::BaseNativeWindowBuffer()
+@@ -27,6 +29,16 @@ extern "C" {
+ 
+ #include "nativewindowbase.h"
+ 
++/* HYBRIS_WINDOW_DEBUG traces every buffer and query operation; read it once
++ * because _query/_perform are called per frame. */
++static bool window_debug()
++{
++	static int enabled = -1;
++	if (enabled < 0)
++		enabled = getenv("HYBRIS_WINDOW_DEBUG") != NULL;
++	return enabled;
++}
++
+ BaseNativeWindowBuffer::BaseNativeWindowBuffer()
+ {
+ 	TRACE("%p", this);
+@@ -44,6 +56,12 @@ BaseNativeWindowBuffer::BaseNativeWindowBuffer()
  	ANativeWindowBuffer::format = 0;
  	ANativeWindowBuffer::usage = 0;
  	ANativeWindowBuffer::handle = 0;
@@ -746,27 +831,27 @@ index 73775b7..79fcad9 100644
  
  	refcount = 0;
  }
-@@ -187,6 +195,7 @@ int BaseNativeWindow::_dequeueBuffer(struct ANativeWindow *window, ANativeWindow
+@@ -187,6 +205,7 @@ int BaseNativeWindow::_dequeueBuffer(struct ANativeWindow *window, ANativeWindow
  	BaseNativeWindowBuffer *nativeBuffer = static_cast<BaseNativeWindowBuffer*>(*buffer);
  	int ret = static_cast<BaseNativeWindow*>(window)->dequeueBuffer(&nativeBuffer, fenceFd);
  	*buffer = static_cast<ANativeWindowBuffer*>(nativeBuffer);
-+	if (getenv("HYBRIS_WINDOW_DEBUG")) fprintf(stderr, "libhybris: dequeue ret=%d buffer=%p fence=%d\n", ret, (void*)nativeBuffer, fenceFd ? *fenceFd : -999);
++	if (window_debug()) fprintf(stderr, "libhybris: dequeue ret=%d buffer=%p fence=%d\n", ret, (void*)nativeBuffer, fenceFd ? *fenceFd : -999);
  	return ret;
  }
  
-@@ -202,8 +211,9 @@ int BaseNativeWindow::_queueBuffer(struct ANativeWindow *window, ANativeWindowBu
+@@ -202,8 +221,9 @@ int BaseNativeWindow::_queueBuffer(struct ANativeWindow *window, ANativeWindowBu
  {
  	BaseNativeWindow *nativeWindow = static_cast<BaseNativeWindow*>(window);
  	BaseNativeWindowBuffer *nativeBuffer = static_cast<BaseNativeWindowBuffer*>(buffer);
 -
 -	return nativeWindow->queueBuffer(nativeBuffer, fenceFd);
 +	int ret = nativeWindow->queueBuffer(nativeBuffer, fenceFd);
-+	if (getenv("HYBRIS_WINDOW_DEBUG")) fprintf(stderr, "libhybris: queue ret=%d buffer=%p fence=%d\n", ret, (void*)nativeBuffer, fenceFd);
++	if (window_debug()) fprintf(stderr, "libhybris: queue ret=%d buffer=%p fence=%d\n", ret, (void*)nativeBuffer, fenceFd);
 +	return ret;
  }
  
  int BaseNativeWindow::_cancelBuffer_DEPRECATED(struct ANativeWindow* window, ANativeWindowBuffer* buffer)
-@@ -248,6 +258,10 @@ const char *BaseNativeWindow::_native_window_operation(int what)
+@@ -248,6 +268,10 @@ const char *BaseNativeWindow::_native_window_operation(int what)
  #if ANDROID_VERSION_MAJOR>=4 && ANDROID_VERSION_MINOR>=1
  		case NATIVE_WINDOW_SET_BUFFERS_USER_DIMENSIONS: return "NATIVE_WINDOW_SET_BUFFERS_USER_DIMENSIONS";
  		case NATIVE_WINDOW_SET_POST_TRANSFORM_CROP: return "NATIVE_WINDOW_SET_POST_TRANSFORM_CROP";
@@ -777,7 +862,7 @@ index 73775b7..79fcad9 100644
  #endif
  		default: return "NATIVE_UNKNOWN_OPERATION";
  	}
-@@ -274,6 +288,9 @@ const char *BaseNativeWindow::_native_query_operation(int what)
+@@ -274,6 +298,9 @@ const char *BaseNativeWindow::_native_query_operation(int what)
  #if ANDROID_VERSION_MAJOR>=8
                  case NATIVE_WINDOW_IS_VALID: return "NATIVE_WINDOW_IS_VALID";
                  case NATIVE_WINDOW_BUFFER_AGE: return "NATIVE_WINDOW_BUFFER_AGE";
@@ -787,15 +872,15 @@ index 73775b7..79fcad9 100644
  #endif
  		default: return "NATIVE_UNKNOWN_QUERY";
  	}
-@@ -282,6 +299,7 @@ const char *BaseNativeWindow::_native_query_operation(int what)
+@@ -282,6 +309,7 @@ const char *BaseNativeWindow::_native_query_operation(int what)
  int BaseNativeWindow::_query(const struct ANativeWindow* window, int what, int* value)
  {
  	TRACE("window:%p %i %s %p", window, what, _native_query_operation(what), value);
-+	if (getenv("HYBRIS_WINDOW_DEBUG")) fprintf(stderr, "libhybris: query %d %s\n", what, _native_query_operation(what));
++	if (window_debug()) fprintf(stderr, "libhybris: query %d %s\n", what, _native_query_operation(what));
  	const BaseNativeWindow* self=static_cast<const BaseNativeWindow*>(window);
  	switch (what) {
  		case NATIVE_WINDOW_WIDTH:
-@@ -328,6 +346,11 @@ int BaseNativeWindow::_query(const struct ANativeWindow* window, int what, int*
+@@ -328,6 +356,11 @@ int BaseNativeWindow::_query(const struct ANativeWindow* window, int what, int*
  			// sure :)
  			*value = 2;
  			return NO_ERROR;
@@ -807,15 +892,15 @@ index 73775b7..79fcad9 100644
  #endif
  	}
  	TRACE("EGL error: unkown window attribute! %i", what);
-@@ -343,6 +366,7 @@ int BaseNativeWindow::_perform(struct ANativeWindow* window, int operation, ...
+@@ -343,6 +376,7 @@ int BaseNativeWindow::_perform(struct ANativeWindow* window, int operation, ...
  
  	// FIXME
  	TRACE("operation = %s", _native_window_operation(operation));
-+	if (getenv("HYBRIS_WINDOW_DEBUG")) fprintf(stderr, "libhybris: perform %d %s\n", operation, _native_window_operation(operation));
++	if (window_debug()) fprintf(stderr, "libhybris: perform %d %s\n", operation, _native_window_operation(operation));
  	switch(operation) {
  	case NATIVE_WINDOW_SET_USAGE                 : //  0,
  	{
-@@ -411,6 +435,21 @@ int BaseNativeWindow::_perform(struct ANativeWindow* window, int operation, ...
+@@ -411,6 +445,21 @@ int BaseNativeWindow::_perform(struct ANativeWindow* window, int operation, ...
  	case NATIVE_WINDOW_SET_POST_TRANSFORM_CROP   : // 16,
  		TRACE("set post transform crop");
  		break;
@@ -824,7 +909,7 @@ index 73775b7..79fcad9 100644
 +	case NATIVE_WINDOW_SET_USAGE64               : // 30,
 +	{
 +		uint64_t usage = va_arg(args, uint64_t);
-+		if (getenv("HYBRIS_WINDOW_DEBUG")) fprintf(stderr, "libhybris: usage64=0x%llx\n", (unsigned long long)usage);
++		if (window_debug()) fprintf(stderr, "libhybris: usage64=0x%llx\n", (unsigned long long)usage);
 +		va_end(args);
 +		return self->setUsage((int)usage);
 +	}
@@ -837,123 +922,51 @@ index 73775b7..79fcad9 100644
  #endif
  	}
  	va_end(args);
-diff --git a/hybris/egl/ws.c b/hybris/egl/ws.c
-index ed20a1c..bbe7647 100644
---- a/hybris/egl/ws.c
-+++ b/hybris/egl/ws.c
-@@ -126,4 +126,13 @@ void ws_setSwapInterval(EGLDisplay dpy, EGLNativeWindowType win, EGLint interval
- 		ws->setSwapInterval(dpy, win, interval);
- }
- 
-+EGLBoolean ws_eglGetConfigAttrib(struct _EGLDisplay *display, EGLConfig config, EGLint attribute, EGLint *value)
-+{
-+	_init_ws();
-+	if (ws->eglGetConfigAttrib)
-+		return ws->eglGetConfigAttrib(display, config, attribute, value);
-+    else
-+        return EGL_FALSE;
-+}
+diff --git a/hybris/egl/platforms/x11/Makefile.am b/hybris/egl/platforms/x11/Makefile.am
+new file mode 100644
+index 0000000..de061fa
+--- /dev/null
++++ b/hybris/egl/platforms/x11/Makefile.am
+@@ -0,0 +1,33 @@
++pkglib_LTLIBRARIES = eglplatform_x11.la
 +
- // vim:ts=4:sw=4:noexpandtab
-diff --git a/hybris/egl/ws.h b/hybris/egl/ws.h
-index c4811c0..92b221a 100644
---- a/hybris/egl/ws.h
-+++ b/hybris/egl/ws.h
-@@ -37,6 +37,7 @@ struct ws_module {
- 	void (*prepareSwap)(EGLDisplay dpy, EGLNativeWindowType win, EGLint *damage_rects, EGLint damage_n_rects);
- 	void (*finishSwap)(EGLDisplay dpy, EGLNativeWindowType win);
- 	void (*setSwapInterval)(EGLDisplay dpy, EGLNativeWindowType win, EGLint interval);
-+    EGLBoolean (*eglGetConfigAttrib)(struct _EGLDisplay *display, EGLConfig config, EGLint attribute, EGLint *value);
- };
- 
- struct _EGLDisplay *ws_GetDisplay(EGLNativeDisplayType native);
-@@ -49,5 +50,6 @@ const char *ws_eglQueryString(EGLDisplay dpy, EGLint name, const char *(*real_eg
- void ws_prepareSwap(EGLDisplay dpy, EGLNativeWindowType win, EGLint *damage_rects, EGLint damage_n_rects);
- void ws_finishSwap(EGLDisplay dpy, EGLNativeWindowType win);
- void ws_setSwapInterval(EGLDisplay dpy, EGLNativeWindowType win, EGLint interval);
-+EGLBoolean ws_eglGetConfigAttrib(struct _EGLDisplay *display, EGLConfig config, EGLint attribute, EGLint *value);
- 
- #endif
-diff --git a/hybris/gralloc/gralloc.c b/hybris/gralloc/gralloc.c
-index 33a7b31..aa150a6 100644
---- a/hybris/gralloc/gralloc.c
-+++ b/hybris/gralloc/gralloc.c
-@@ -178,6 +178,12 @@ static void gralloc1_init(void)
-         free(gralloc1_capabilities);
-     }
- 
-+    /* Samsung's Android 9 Exynos gralloc releases and deletes native handles
-+     * but does not advertise GRALLOC1_CAPABILITY_RELEASE_IMPLY_DELETE. Avoid a
-+     * host-side native_handle_delete double free when explicitly requested. */
-+    if (getenv("HYBRIS_GRALLOC1_RELEASE_IMPLY_DELETE"))
-+        gralloc1_release_implies_delete = 1;
++eglplatform_x11_la_SOURCES = eglplatform_x11.cpp x11_window.cpp xcb_drihybris.c
++eglplatform_x11_la_CPPFLAGS = \
++	-I$(top_srcdir)/common \
++	-I$(top_srcdir)/include \
++	-I$(top_srcdir)/egl \
++	-I$(top_srcdir)/egl/platforms/common \
++	$(ANDROID_HEADERS_CFLAGS) \
++	$(X11_CFLAGS)
++eglplatform_x11_la_CXXFLAGS =
 +
-     gralloc1_create_descriptor = (GRALLOC1_PFN_CREATE_DESCRIPTOR)gralloc1_device->getFunction(gralloc1_device, GRALLOC1_FUNCTION_CREATE_DESCRIPTOR);
-     gralloc1_destroy_descriptor = (GRALLOC1_PFN_DESTROY_DESCRIPTOR)gralloc1_device->getFunction(gralloc1_device, GRALLOC1_FUNCTION_DESTROY_DESCRIPTOR);
-     gralloc1_set_consumer_usage = (GRALLOC1_PFN_SET_CONSUMER_USAGE)gralloc1_device->getFunction(gralloc1_device, GRALLOC1_FUNCTION_SET_CONSUMER_USAGE);
-diff --git a/hybris/libsync/sync.c b/hybris/libsync/sync.c
-index dbc3eba..e66840a 100644
---- a/hybris/libsync/sync.c
-+++ b/hybris/libsync/sync.c
-@@ -27,6 +27,7 @@
- #include <linux/sync.h>
- #include <linux/sw_sync.h>
- #else
-+#include <sys/cdefs.h>
- #include <sync/sync.h>
- #endif
- 
-diff --git a/hybris/tests/Makefile.am b/hybris/tests/Makefile.am
-index 6f97c3e..d9190f6 100644
---- a/hybris/tests/Makefile.am
-+++ b/hybris/tests/Makefile.am
-@@ -1,22 +1,9 @@
-+# Keep the musl/Android 4.4 probe build focused on graphics. Several unrelated
-+# legacy tests unconditionally require Wayland even for the fbdev platform.
- bin_PROGRAMS = \
--	test_audio \
- 	test_egl \
- 	test_egl_configs \
--	test_glesv2 \
--	test_sf \
--	test_sensors \
--	test_input \
--	test_lights \
--	test_camera \
--	test_vibrator \
--	test_media \
--	test_recorder \
--	test_gps \
--	test_opencl \
--	test_wifi \
--	test_hwc2 \
--	test_hwcomposer \
--	test_nfc
-+	test_glesv2
- 
- test_audio_SOURCES = test_audio.c
- test_audio_CFLAGS = \
-diff --git a/hybris/tests/test_camera.c b/hybris/tests/test_camera.c
-index 7ac81f4..b7993a9 100644
---- a/hybris/tests/test_camera.c
-+++ b/hybris/tests/test_camera.c
-@@ -45,6 +45,10 @@
- #include <sys/stat.h>
- #include <sys/types.h>
- 
-+#ifndef __GLIBC__
-+#include <hybris/common/musl_compat.h>
-+#endif
++if WANT_TRACE
++eglplatform_x11_la_CXXFLAGS += -DDEBUG
++endif
 +
- int shot_counter = 1;
- int32_t current_zoom_level = 1;
- bool new_camera_frame_available = true;
++if WANT_DEBUG
++eglplatform_x11_la_CXXFLAGS += -ggdb -O0
++endif
++
++eglplatform_x11_la_LDFLAGS = \
++	-avoid-version -module -shared -export-dynamic \
++	$(top_builddir)/egl/platforms/common/libhybris-eglplatformcommon.la \
++	$(top_builddir)/gralloc/libgralloc.la \
++	$(X11_LIBS)
++
++if HAS_ANDROID_4_2_0
++eglplatform_x11_la_LDFLAGS += $(top_builddir)/libsync/libsync.la
++endif
++
++if HAS_ANDROID_5_0_0
++eglplatform_x11_la_LDFLAGS += $(top_builddir)/libsync/libsync.la
++endif
 diff --git a/hybris/egl/platforms/x11/eglplatform_x11.cpp b/hybris/egl/platforms/x11/eglplatform_x11.cpp
 new file mode 100644
-index 0000000..0490737
+index 0000000..45be326
 --- /dev/null
 +++ b/hybris/egl/platforms/x11/eglplatform_x11.cpp
-@@ -0,0 +1,235 @@
+@@ -0,0 +1,243 @@
 +/****************************************************************************************
 +**
 +** Copyright (C) 2013 Jolla Ltd.
@@ -982,27 +995,16 @@ index 0000000..0490737
 +
 +#include <android-config.h>
 +#include <ws.h>
-+#include <malloc.h>
 +#include <assert.h>
-+#include <fcntl.h>
 +#include <stdio.h>
 +#include <stdlib.h>
 +#include <string.h>
-+#include <sys/stat.h>
-+#include <unistd.h>
-+#include <assert.h>
-+#include <stdlib.h>
 +extern "C" {
 +#include <eglplatformcommon.h>
 +};
 +#include <eglhybris.h>
 +
 +#include <EGL/eglext.h>
-+
-+extern "C" {
-+#include <wayland-client.h>
-+#include <wayland-egl.h>
-+}
 +
 +#include <hybris/gralloc/gralloc.h>
 +#include "x11_window.h"
@@ -1042,16 +1044,15 @@ index 0000000..0490737
 +
 +	const char *extensions = (*_eglQueryString)(display, EGL_EXTENSIONS);
 +
-+	if (strstr(extensions, "EGL_KHR_fence_sync")) {
++	if (extensions && strstr(extensions, "EGL_KHR_fence_sync")) {
 +		_eglCreateSyncKHR = (PFNEGLCREATESYNCKHRPROC)
 +				(*_eglGetProcAddress)("eglCreateSyncKHR");
-+		assert(_eglCreateSyncKHR);
 +		_eglDestroySyncKHR = (PFNEGLDESTROYSYNCKHRPROC)
 +				(*_eglGetProcAddress)("eglDestroySyncKHR");
-+		assert(_eglDestroySyncKHR);
 +		_eglClientWaitSyncKHR = (PFNEGLCLIENTWAITSYNCKHRPROC)
 +				(*_eglGetProcAddress)("eglClientWaitSyncKHR");
-+		assert(_eglClientWaitSyncKHR);
++		if (!_eglCreateSyncKHR || !_eglDestroySyncKHR || !_eglClientWaitSyncKHR)
++			_eglCreateSyncKHR = NULL;
 +	}
 +}
 +
@@ -1066,7 +1067,6 @@ index 0000000..0490737
 +extern "C" void x11ws_Terminate(_EGLDisplay *dpy)
 +{
 +	X11Display *xdpy = (X11Display *)dpy;
-+	int ret = 0;
 +	delete xdpy;
 +}
 +
@@ -1077,9 +1077,9 @@ index 0000000..0490737
 +
 +	if (win == 0 || xdpy->xl_display == 0) {
 +		HYBRIS_ERROR("Running with EGL_PLATFORM=x11 without X server is not possible");
-+		HYBRIS_ERROR("If you want to run a standlone EGL client do it like this:");
++		HYBRIS_ERROR("If you want to run a standalone EGL client do it like this:");
 +		HYBRIS_ERROR(" $ export EGL_PLATFORM=null");
-+		HYBRIS_ERROR(" $ test_glevs2");
++		HYBRIS_ERROR(" $ test_glesv2");
 +		abort();
 +	}
 +
@@ -1109,10 +1109,22 @@ index 0000000..0490737
 +	const char *ret = eglplatformcommon_eglQueryString(dpy, name, real_eglQueryString);
 +	if (ret && name == EGL_EXTENSIONS)
 +	{
-+		static char eglextensionsbuf[1024];
-+		snprintf(eglextensionsbuf, 1022, "%s %s", ret,
-+			"EGL_EXT_swap_buffers_with_damage EGL_WL_create_x11_buffer_from_image"
-+		);
++		/* Mali advertises well over a kilobyte of extensions; size the
++		 * buffer from the driver string instead of truncating it. */
++		static const char extra[] = " EGL_EXT_swap_buffers_with_damage";
++		static char *eglextensionsbuf = NULL;
++		static size_t eglextensionsbuf_size = 0;
++		size_t needed = strlen(ret) + sizeof(extra);
++
++		if (needed > eglextensionsbuf_size) {
++			char *grown = (char *)realloc(eglextensionsbuf, needed);
++			if (!grown)
++				return ret;
++			eglextensionsbuf = grown;
++			eglextensionsbuf_size = needed;
++		}
++		memcpy(eglextensionsbuf, ret, needed - sizeof(extra));
++		memcpy(eglextensionsbuf + needed - sizeof(extra), extra, sizeof(extra));
 +		ret = eglextensionsbuf;
 +	}
 +	return ret;
@@ -1129,9 +1141,13 @@ index 0000000..0490737
 +	_init_egl_funcs(dpy);
 +	X11NativeWindow *window = static_cast<X11NativeWindow *>((struct ANativeWindow *)win);
 +	if (_eglCreateSyncKHR) {
++		/* The buffer is copied or imported by the X server right after this,
++		 * so rendering must have finished on the GPU. */
 +		EGLSyncKHR sync = (*_eglCreateSyncKHR)(dpy, EGL_SYNC_FENCE_KHR, NULL);
-+		(*_eglClientWaitSyncKHR)(dpy, sync, EGL_SYNC_FLUSH_COMMANDS_BIT_KHR, EGL_FOREVER_KHR);
-+		(*_eglDestroySyncKHR)(dpy, sync);
++		if (sync != EGL_NO_SYNC_KHR) {
++			(*_eglClientWaitSyncKHR)(dpy, sync, EGL_SYNC_FLUSH_COMMANDS_BIT_KHR, EGL_FOREVER_KHR);
++			(*_eglDestroySyncKHR)(dpy, sync);
++		}
 +	}
 +	window->finishSwap();
 +}
@@ -1144,35 +1160,40 @@ index 0000000..0490737
 +
 +extern "C" EGLBoolean x11ws_eglGetConfigAttrib(struct _EGLDisplay *display, EGLConfig config, EGLint attribute, EGLint *value)
 +{
-+    TRACE("attribute:%i", attribute);
-+    if (attribute == EGL_NATIVE_VISUAL_ID)
-+    {
-+        X11Display *xdpy = (X11Display *)display;
-+        /* Pbuffer/surfaceless users such as WebKit WebGL legitimately pass
-+         * EGL_DEFAULT_DISPLAY (NULL). In that case there is no X visual to
-+         * translate; defer to the Mali EGL driver's native visual ID. */
-+        if (!xdpy->xl_display)
-+            return EGL_FALSE;
-+        XVisualInfo visinfo_template;
-+        XVisualInfo *visinfo = NULL;
-+        int visinfos_count = 0;
++	TRACE("attribute:%i", attribute);
++	if (attribute == EGL_NATIVE_VISUAL_ID)
++	{
++		X11Display *xdpy = (X11Display *)display;
++		/* Pbuffer/surfaceless users such as WebKit WebGL legitimately pass
++		 * EGL_DEFAULT_DISPLAY (NULL). In that case there is no X visual to
++		 * translate; defer to the Mali EGL driver's native visual ID. */
++		if (!xdpy->xl_display)
++			return EGL_FALSE;
++		XVisualInfo visinfo_template;
++		XVisualInfo *visinfo = NULL;
++		int visinfos_count = 0;
 +
-+        visinfo_template.depth = DefaultDepth(xdpy->xl_display,
-+                                              DefaultScreen(xdpy->xl_display));
-+        visinfo = XGetVisualInfo (xdpy->xl_display,
-+                            VisualDepthMask,
-+                            &visinfo_template,
-+                            &visinfos_count);
++		visinfo_template.depth = DefaultDepth(xdpy->xl_display,
++		                                      DefaultScreen(xdpy->xl_display));
++		visinfo = XGetVisualInfo(xdpy->xl_display,
++		                         VisualDepthMask,
++		                         &visinfo_template,
++		                         &visinfos_count);
 +
-+        if (visinfos_count)
-+        {
-+            TRACE("visinfo.visualid:%i", attribute);
-+            *value = visinfo->visualid;
-+            return EGL_TRUE;
-+        }
-+
-+    }
-+    return EGL_FALSE;
++		if (visinfo)
++		{
++			EGLBoolean found = EGL_FALSE;
++			if (visinfos_count)
++			{
++				TRACE("visinfo.visualid:%lu", (unsigned long)visinfo->visualid);
++				*value = visinfo->visualid;
++				found = EGL_TRUE;
++			}
++			XFree(visinfo);
++			return found;
++		}
++	}
++	return EGL_FALSE;
 +}
 +
 +struct ws_module ws_module_info = {
@@ -1187,70 +1208,21 @@ index 0000000..0490737
 +	x11ws_prepareSwap,
 +	x11ws_finishSwap,
 +	x11ws_setSwapInterval,
-+    x11ws_eglGetConfigAttrib
++	x11ws_eglGetConfigAttrib
 +};
-diff --git a/hybris/egl/platforms/x11/Makefile.am b/hybris/egl/platforms/x11/Makefile.am
-new file mode 100644
-index 0000000..4ab00f2
---- /dev/null
-+++ b/hybris/egl/platforms/x11/Makefile.am
-@@ -0,0 +1,43 @@
-+pkglib_LTLIBRARIES = eglplatform_x11.la
-+
-+eglplatform_x11_la_SOURCES = eglplatform_x11.cpp x11_window.cpp xcb_drihybris.c
-+eglplatform_x11_la_CXXFLAGS = \
-+	-I$(top_srcdir)/common \
-+	-I$(top_srcdir)/include \
-+	-I$(top_srcdir)/egl \
-+	-I$(top_srcdir)/egl/platforms/common \
-+	$(ANDROID_HEADERS_CFLAGS) \
-+	$(WAYLAND_CLIENT_CFLAGS)
-+
-+if WANT_DEBUG
-+eglplatform_x11_la_CXXFLAGS += -I$(top_srcdir)/common
-+endif
-+
-+if WANT_TRACE
-+eglplatform_x11_la_CXXFLAGS += -DDEBUG
-+endif
-+
-+if WANT_DEBUG
-+eglplatform_x11_la_CXXFLAGS += -ggdb -O0
-+endif
-+
-+if !WANT_WL_SERVERSIDE_BUFFERS
-+eglplatform_x11_la_CXXFLAGS += -DHYBRIS_NO_SERVER_SIDE_BUFFERS
-+endif
-+
-+
-+
-+eglplatform_x11_la_LDFLAGS = \
-+	-avoid-version -module -shared -export-dynamic \
-+	$(top_builddir)/egl/platforms/common/libhybris-eglplatformcommon.la \
-+	$(top_builddir)/gralloc/libgralloc.la \
-+	-lXext -lxcb -lX11-xcb -lxcb-present
-+
-+if HAS_ANDROID_4_2_0
-+eglplatform_x11_la_LDFLAGS += $(top_builddir)/libsync/libsync.la
-+endif
-+
-+if HAS_ANDROID_5_0_0
-+eglplatform_x11_la_LDFLAGS += $(top_builddir)/libsync/libsync.la
-+endif
-+
 diff --git a/hybris/egl/platforms/x11/x11_window.cpp b/hybris/egl/platforms/x11/x11_window.cpp
 new file mode 100644
-index 0000000..542461d
+index 0000000..820c4ba
 --- /dev/null
 +++ b/hybris/egl/platforms/x11/x11_window.cpp
-@@ -0,0 +1,764 @@
+@@ -0,0 +1,830 @@
 +/****************************************************************************************
 + **
 + ** Copyright (C) 2013 Jolla Ltd.
 + ** Contact: Carsten Munk <carsten.munk@jollamobile.com>
 + ** All rights reserved.
 + **
-+ ** This file is part of Wayland enablement for libhybris
++ ** This file is part of X11 enablement for libhybris
 + **
 + ** You may use this file under the terms of the GNU Lesser General
 + ** Public License version 2.1 as published by the Free Software Foundation
@@ -1273,19 +1245,30 @@ index 0000000..542461d
 +#include <android-config.h>
 +#include "x11_window.h"
 +#include <assert.h>
++#include <stdio.h>
 +#include <stdlib.h>
 +#include <string.h>
 +#include <errno.h>
++#include <unistd.h>
 +
 +#include "logging.h"
 +#include <eglhybris.h>
 +#include "xcb_drihybris.h"
++#include <X11/Xutil.h>
 +
 +#if ANDROID_VERSION_MAJOR>=4 && ANDROID_VERSION_MINOR>=2 || ANDROID_VERSION_MAJOR>=5
 +extern "C" {
 +#include <sync/sync.h>
 +}
 +#endif
++
++static bool window_debug()
++{
++    static int enabled = -1;
++    if (enabled < 0)
++        enabled = getenv("HYBRIS_WINDOW_DEBUG") != NULL;
++    return enabled;
++}
 +
 +void X11NativeWindow::resize(unsigned int width, unsigned int height)
 +{
@@ -1307,14 +1290,14 @@ index 0000000..542461d
 +
 +X11NativeWindow::X11NativeWindow(Display* xl_display, Window xl_window)
 +{
-+    int wayland_ok;
-+
 +    HYBRIS_TRACE_BEGIN("x11-platform", "create_window", "");
 +    this->m_window = xl_window;
 +    this->m_display = xl_display;
 +    this->m_connection = XGetXCBConnection(xl_display);
 +    this->m_image = 0;
-+    this->m_useShm = true;
++    memset(&this->m_shminfo, 0, sizeof(this->m_shminfo));
++    this->m_shminfo.shmid = -1;
++    this->m_useShm = XShmQueryExtension(xl_display) ? true : false;
 +    this->m_format = HAL_PIXEL_FORMAT_RGBA_8888;
 +
 +    const_cast<int&>(ANativeWindow::minSwapInterval) = 0;
@@ -1325,7 +1308,13 @@ index 0000000..542461d
 +    TRACE("getting X11 window information");
 +
 +    XWindowAttributes window_attributes;
-+    XGetWindowAttributes(m_display, m_window, &window_attributes);
++    memset(&window_attributes, 0, sizeof(window_attributes));
++    if (!XGetWindowAttributes(m_display, m_window, &window_attributes)) {
++        HYBRIS_ERROR("XGetWindowAttributes failed for window 0x%lx", (unsigned long)m_window);
++        window_attributes.width = 1;
++        window_attributes.height = 1;
++        window_attributes.depth = DefaultDepth(m_display, DefaultScreen(m_display));
++    }
 +
 +    TRACE("window x=%d y=%d width=%d height=%d depth=%d",
 +        window_attributes.x,
@@ -1337,9 +1326,9 @@ index 0000000..542461d
 +    m_width = window_attributes.width;
 +    m_height = window_attributes.height;
 +    m_depth = window_attributes.depth;
-+    /* The SM-T561 Xorg fbdev session is RGB565. Keeping gralloc buffers in
-+     * the same format avoids a full-frame RGBA8888 conversion and, more
-+     * importantly, never asks the underlying framebuffer for 32 bpp. */
++    /* Keep gralloc buffers in the X visual's layout: a 16 bpp fbdev session
++     * (RGB565) must never be asked for 32 bpp scanout, and a 24-bit visual
++     * has no alpha, so copying RGBX straight into the XImage is correct. */
 +    if (m_depth <= 16)
 +        m_format = HAL_PIXEL_FORMAT_RGB_565;
 +    else if (m_depth == 24)
@@ -1381,8 +1370,6 @@ index 0000000..542461d
 +
 +    m_usage=GRALLOC_USAGE_HW_RENDER | GRALLOC_USAGE_HW_TEXTURE | GRALLOC_USAGE_SW_READ_OFTEN;
 +    pthread_mutex_init(&mutex, NULL);
-+    pthread_cond_init(&cond, NULL);
-+    m_queueReads = 0;
 +    m_freeBufs = 0;
 +    m_damage_rects = NULL;
 +    m_damage_n_rects = 0;
@@ -1393,8 +1380,13 @@ index 0000000..542461d
 +
 +X11NativeWindow::~X11NativeWindow()
 +{
-+    std::list<X11NativeWindowBuffer *>::iterator it = m_bufList.begin();
 +    destroyBuffers();
++    destroyImage();
++    if (m_specialEvent)
++        xcb_unregister_for_special_event(m_connection, m_specialEvent);
++    xcb_free_gc(m_connection, m_xcb_gc);
++    XFreeGC(m_display, m_gc);
++    pthread_mutex_destroy(&mutex);
 +}
 +
 +// overloads from BaseNativeWindow
@@ -1423,18 +1415,26 @@ index 0000000..542461d
 +    X11NativeWindowBuffer *wnb=NULL;
 +    TRACE("%p", buffer);
 +
-+    readQueue(false);
++    readQueue();
 +
 +    HYBRIS_TRACE_BEGIN("x11-platform", "dequeueBuffer_wait_for_buffer", "");
 +
 +    HYBRIS_TRACE_COUNTER("x11-platform", "m_freeBufs", "%i", m_freeBufs);
 +
-+    while (m_freeBufs == 0) {
-+        HYBRIS_TRACE_COUNTER("x11-platform", "m_freeBufs", "%i", m_freeBufs);
-+        readQueue(true);
-+    }
-+
 +    lock();
++
++    /* Buffers are returned synchronously by finishSwap()/cancelBuffer(), so
++     * nothing can free one while we would wait here. Fail instead of
++     * spinning forever if the driver holds every buffer. */
++    if (m_freeBufs == 0) {
++        unlock();
++        HYBRIS_TRACE_BEGIN("x11-platform", "dequeueBuffer_no_free_buffers", "");
++        HYBRIS_TRACE_END("x11-platform", "dequeueBuffer_no_free_buffers", "");
++        TRACE("%p: no free buffers", buffer);
++        HYBRIS_TRACE_END("x11-platform", "dequeueBuffer_wait_for_buffer", "");
++        HYBRIS_TRACE_END("x11-platform", "dequeueBuffer", "");
++        return -EBUSY;
++    }
 +
 +    std::list<X11NativeWindowBuffer *>::iterator it = m_bufList.begin();
 +    for (; it != m_bufList.end(); it++)
@@ -1460,7 +1460,7 @@ index 0000000..542461d
 +        HYBRIS_TRACE_BEGIN("x11-platform", "dequeueBuffer_no_free_buffers", "");
 +        HYBRIS_TRACE_END("x11-platform", "dequeueBuffer_no_free_buffers", "");
 +        TRACE("%p: no free buffers", buffer);
-+        return NO_ERROR;
++        return -EBUSY;
 +    }
 +
 +    wnb = *it;
@@ -1468,13 +1468,15 @@ index 0000000..542461d
 +    HYBRIS_TRACE_END("x11-platform", "dequeueBuffer_wait_for_buffer", "");
 +
 +    /* If the buffer doesn't match the window anymore, re-allocate */
-+    if (wnb->width != m_width || wnb->height != m_height
-+        || wnb->format != m_format || wnb->usage != m_usage)
++    if ((unsigned int)wnb->width != m_width || (unsigned int)wnb->height != m_height
++        || (unsigned int)wnb->format != m_format || (unsigned int)wnb->usage != m_usage)
 +    {
 +        TRACE("wnb:%p,win:%p %i,%i %i,%i x%x,x%x x%x,x%x",
 +            wnb,m_window,
 +            wnb->width,m_width, wnb->height,m_height,
 +            wnb->format,m_format, wnb->usage,m_usage);
++        if (wnb == m_lastBuffer)
++            m_lastBuffer = NULL;
 +        destroyBuffer(wnb);
 +        m_bufList.erase(it);
 +        wnb = addBuffer();
@@ -1482,6 +1484,8 @@ index 0000000..542461d
 +
 +    wnb->busy = 1;
 +    *buffer = wnb;
++    if (fenceFd)
++        *fenceFd = -1;
 +    queue.push_back(wnb);
 +    --m_freeBufs;
 +
@@ -1496,47 +1500,24 @@ index 0000000..542461d
 +
 +int X11NativeWindow::lockBuffer(BaseNativeWindowBuffer* buffer){
 +    X11NativeWindowBuffer *wnb = (X11NativeWindowBuffer*) buffer;
++    (void)wnb;
 +    HYBRIS_TRACE_BEGIN("x11-platform", "lockBuffer", "-%p", wnb);
 +    HYBRIS_TRACE_END("x11-platform", "lockBuffer", "-%p", wnb);
 +    return NO_ERROR;
 +}
 +
-+int X11NativeWindow::readQueue(bool block)
++/* Drain pending Present events (window size changes) without blocking. */
++void X11NativeWindow::readQueue()
 +{
-+    int ret = 0;
++    xcb_generic_event_t *ev;
 +
-+    if (++m_queueReads == 1) {
-+        if (m_specialEvent) {
-+            xcb_generic_event_t    *ev;
++    if (!m_specialEvent)
++        return;
 +
-+            if (!block)
-+            {
-+                while ((ev = xcb_poll_for_special_event(m_connection,
-+                                                        m_specialEvent)) != NULL) {
-+                    xcb_present_generic_event_t *ge = (xcb_present_generic_event_t *) ev;
-+                    handlePresentEvent(ge);
-+                }
-+            }
-+        }
-+
-+        // all threads waiting on the false branch will wake and return now, so we
-+        // can safely set m_queueReads to 0 here instead of relying on every thread
-+        // to decrement it. This prevents a race condition when a thread enters readQueue()
-+        // before the one in this thread returns.
-+        // The new thread would go in the false branch, and there would be no thread in the
-+        // true branch, blocking the new thread and any other that will call readQueue in
-+        // the future.
-+        m_queueReads = 0;
-+
-+        pthread_cond_broadcast(&cond);
-+
-+    } else if (block) {
-+        while (m_queueReads > 0) {
-+            pthread_cond_wait(&cond, &mutex);
-+        }
++    while ((ev = xcb_poll_for_special_event(m_connection, m_specialEvent)) != NULL) {
++        handlePresentEvent((xcb_present_generic_event_t *) ev);
++        free(ev);
 +    }
-+
-+    return ret;
 +}
 +
 +void X11NativeWindow::prepareSwap(EGLint *damage_rects, EGLint damage_n_rects)
@@ -1550,20 +1531,23 @@ index 0000000..542461d
 +void X11NativeWindow::finishSwap()
 +{
 +    static int serial = 0;
-+    int ret = 0;
 +    lock();
 +
-+    X11NativeWindowBuffer *wnb = queue.front();
-+    if (!wnb) {
-+        wnb = m_lastBuffer;
-+    } else {
++    /* The driver queued the oldest dequeued buffer. An eglSwapBuffers without
++     * a new frame re-presents the previous one. */
++    X11NativeWindowBuffer *wnb = NULL;
++    bool fromQueue = !queue.empty();
++    if (fromQueue) {
++        wnb = queue.front();
 +        queue.pop_front();
++    } else {
++        wnb = m_lastBuffer;
 +    }
-+    assert(wnb);
++    if (!wnb) {
++        unlock();
++        return;
++    }
 +    m_lastBuffer = wnb;
-+    wnb->busy = 1;
-+
-+    // fronted.push_back(wnb);
 +
 +    m_damage_rects = NULL;
 +    m_damage_n_rects = 0;
@@ -1589,24 +1573,27 @@ index 0000000..542461d
 +                            0,
 +                            0, 0, NULL);
 +        xcb_flush(m_connection);
-+
-+        lock();
-+
-+        ++m_freeBufs;
-+        HYBRIS_TRACE_COUNTER("x11-platform", "m_freeBufs", "%i", m_freeBufs);
-+
-+        std::list<X11NativeWindowBuffer *>::iterator it;
-+        for (it = m_bufList.begin(); it != m_bufList.end(); it++)
-+        {
-+            (*it)->youngest = 0;
-+        }
-+        wnb->youngest = 1;
-+        wnb->busy = 0;
-+
-+        unlock();
 +    } else {
 +        copyToX11(wnb);
 +    }
++
++    if (!fromQueue)
++        return;
++
++    lock();
++
++    ++m_freeBufs;
++    HYBRIS_TRACE_COUNTER("x11-platform", "m_freeBufs", "%i", m_freeBufs);
++
++    std::list<X11NativeWindowBuffer *>::iterator it;
++    for (it = m_bufList.begin(); it != m_bufList.end(); it++)
++    {
++        (*it)->youngest = 0;
++    }
++    wnb->youngest = 1;
++    wnb->busy = 0;
++
++    unlock();
 +}
 +
 +static int debugenvchecked = 0;
@@ -1614,14 +1601,13 @@ index 0000000..542461d
 +int X11NativeWindow::queueBuffer(BaseNativeWindowBuffer* buffer, int fenceFd)
 +{
 +    X11NativeWindowBuffer *wnb = (X11NativeWindowBuffer*) buffer;
-+    int ret = 0;
 +
 +    HYBRIS_TRACE_BEGIN("x11-platform", "queueBuffer", "-%p", wnb);
 +    lock();
 +
 +    if (debugenvchecked == 0)
 +    {
-+        if (getenv("HYBRIS_WAYLAND_DUMP_BUFFERS") != NULL)
++        if (getenv("HYBRIS_X11_DUMP_BUFFERS") != NULL)
 +            debugenvchecked = 2;
 +        else
 +            debugenvchecked = 1;
@@ -1644,7 +1630,6 @@ index 0000000..542461d
 +    HYBRIS_TRACE_END("x11-platform", "queueBuffer_waiting_for_fence", "-%p", wnb);
 +#endif
 +
-+    HYBRIS_TRACE_COUNTER("x11-platform", "fronted.size", "%i", fronted.size());
 +    HYBRIS_TRACE_END("x11-platform", "queueBuffer", "-%p", wnb);
 +
 +    unlock();
@@ -1667,6 +1652,18 @@ index 0000000..542461d
 +    }
 +    assert(it != m_bufList.end());
 +
++    /* A cancelled buffer will not be queued, so it must not be presented. */
++    for (std::deque<X11NativeWindowBuffer *>::iterator q = queue.begin(); q != queue.end(); ++q)
++    {
++        if (*q == wnb) {
++            queue.erase(q);
++            break;
++        }
++    }
++
++    if (fenceFd >= 0)
++        close(fenceFd);
++
 +    wnb->busy = 0;
 +    ++m_freeBufs;
 +    HYBRIS_TRACE_COUNTER("x11-platform", "m_freeBufs", "%i", m_freeBufs);
@@ -1676,14 +1673,6 @@ index 0000000..542461d
 +        (*it)->youngest = 0;
 +    }
 +    wnb->youngest = 1;
-+
-+    if (m_queueReads != 0) {
-+        // Some thread is waiting on wl_display_dispatch_queue(), possibly waiting for a wl_buffer.release
-+        // event. Since we have now cancelled a buffer push an artificial event so that the dispatch returns
-+        // and the thread can notice the cancelled buffer. This means there is a delay of one roundtrip,
-+        // but I don't see other solution except having one dedicated thread for calling wl_display_dispatch_queue().
-+        //wl_callback_destroy(wl_display_sync(m_display));
-+    }
 +
 +    HYBRIS_TRACE_END("x11-platform", "cancelBuffer", "-%p", wnb);
 +    unlock();
@@ -1749,7 +1738,7 @@ index 0000000..542461d
 +     * pin it to the actual X visual so scanout layout cannot be corrupted. */
 +    if (m_depth <= 16)
 +        format = HAL_PIXEL_FORMAT_RGB_565;
-+    if (format != m_format)
++    if ((unsigned int)format != m_format)
 +    {
 +        TRACE("old-format:x%x new-format:x%x", m_format, format);
 +        m_format = format;
@@ -1766,8 +1755,6 @@ index 0000000..542461d
 +
 +    assert(wnb != NULL);
 +
-+    int ret = 0;
-+
 +    wnb->common.decRef(&wnb->common);
 +    m_freeBufs--;
 +}
@@ -1776,13 +1763,13 @@ index 0000000..542461d
 +{
 +    TRACE("");
 +
-+    std::list<X11NativeWindowBuffer*>::iterator it = m_bufList.begin();
-+    for (; it!=m_bufList.end(); ++it)
++    while (!m_bufList.empty())
 +    {
-+        destroyBuffer(*it);
-+        it = m_bufList.erase(it);
++        destroyBuffer(m_bufList.front());
++        m_bufList.pop_front();
 +    }
-+    m_bufList.clear();
++    queue.clear();
++    m_lastBuffer = NULL;
 +    m_freeBufs = 0;
 +}
 +
@@ -1801,30 +1788,32 @@ index 0000000..542461d
 +}
 +
 +int X11NativeWindow::setBufferCount(int cnt) {
-+    int start = 0;
-+
 +    TRACE("cnt:%d", cnt);
 +
-+    if (m_bufList.size() == cnt)
++    if ((int)m_bufList.size() == cnt)
 +        return NO_ERROR;
 +
 +    lock();
 +
-+    if (m_bufList.size() > cnt) {
-+        /* Decreasing buffer count, remove from beginning */
++    if ((int)m_bufList.size() > cnt) {
++        /* Decreasing buffer count: drop idle buffers, never one the driver
++         * still holds. */
 +        std::list<X11NativeWindowBuffer*>::iterator it = m_bufList.begin();
-+        for (int i = 0; i <= m_bufList.size() - cnt; i++ )
++        while (it != m_bufList.end() && (int)m_bufList.size() > cnt)
 +        {
++            if ((*it)->busy) {
++                ++it;
++                continue;
++            }
++            if (*it == m_lastBuffer)
++                m_lastBuffer = NULL;
 +            destroyBuffer(*it);
-+            ++it;
-+            m_bufList.pop_front();
++            it = m_bufList.erase(it);
 +        }
-+
 +    } else {
 +        /* Increasing buffer count, start from current size */
 +        for (int i = m_bufList.size(); i < cnt; i++)
-+            X11NativeWindowBuffer *unused = addBuffer();
-+
++            addBuffer();
 +    }
 +
 +    unlock();
@@ -1833,7 +1822,7 @@ index 0000000..542461d
 +}
 +
 +int X11NativeWindow::setBuffersDimensions(int width, int height) {
-+    if (m_width != width || m_height != height)
++    if (m_width != (unsigned int)width || m_height != (unsigned int)height)
 +    {
 +        TRACE("old-size:%ix%i new-size:%ix%i", m_width, m_height, width, height);
 +        m_width = width;
@@ -1851,7 +1840,7 @@ index 0000000..542461d
 +     * Bifrost refuses as a render target. We request CPU read access only
 +     * while presenting the completed buffer to X11. */
 +    const unsigned int requested = (unsigned int)usage;
-+    if (getenv("HYBRIS_WINDOW_DEBUG"))
++    if (window_debug())
 +        fprintf(stderr, "libhybris-x11: usage old=0x%x requested=0x%x effective=0x%x\n", m_usage, usage, requested);
 +    if (requested != m_usage)
 +    {
@@ -1861,80 +1850,126 @@ index 0000000..542461d
 +    return NO_ERROR;
 +}
 +
++/* Create the XImage used to present gralloc buffers at the current window
++ * size. Prefers MIT-SHM and falls back to a plain XPutImage image. */
++bool X11NativeWindow::createImage()
++{
++    if (m_useShm)
++    {
++        m_image = XShmCreateImage(m_display, CopyFromParent, m_depth,
++                                  ZPixmap, 0, &m_shminfo, m_width, m_height);
++        if (m_image)
++        {
++            size_t size = (size_t)m_image->bytes_per_line * m_image->height;
++            m_shminfo.shmid = shmget(IPC_PRIVATE, size, IPC_CREAT | 0777);
++            m_shminfo.shmaddr = m_shminfo.shmid >= 0 ? (char *)shmat(m_shminfo.shmid, 0, 0) : (char *)-1;
++            m_shminfo.readOnly = False;
++
++            if (m_shminfo.shmaddr != (char *)-1 && XShmAttach(m_display, &m_shminfo))
++            {
++                /* Once the server has attached, mark the segment for removal so
++                 * it disappears with the last detach instead of outliving a
++                 * crashed client. */
++                XSync(m_display, False);
++                shmctl(m_shminfo.shmid, IPC_RMID, NULL);
++                m_image->data = m_shminfo.shmaddr;
++                TRACE("m_shminfo.shmaddr %p", m_shminfo.shmaddr);
++                return true;
++            }
++
++            HYBRIS_ERROR("MIT-SHM setup failed (%s), falling back to XPutImage", strerror(errno));
++            if (m_shminfo.shmaddr != (char *)-1)
++                shmdt(m_shminfo.shmaddr);
++            if (m_shminfo.shmid >= 0)
++                shmctl(m_shminfo.shmid, IPC_RMID, NULL);
++            m_shminfo.shmaddr = NULL;
++            m_shminfo.shmid = -1;
++            XDestroyImage(m_image);
++            m_image = NULL;
++        }
++        m_useShm = false;
++    }
++
++    m_image = XCreateImage(m_display, CopyFromParent, m_depth, ZPixmap, 0,
++                           NULL, m_width, m_height, m_depth <= 16 ? 16 : 32, 0);
++    return m_image != NULL;
++}
++
++void X11NativeWindow::destroyImage()
++{
++    if (!m_image)
++        return;
++
++    if (m_shminfo.shmaddr)
++    {
++        XShmDetach(m_display, &m_shminfo);
++        XSync(m_display, False);
++        shmdt(m_shminfo.shmaddr);
++        m_shminfo.shmaddr = NULL;
++        m_shminfo.shmid = -1;
++    }
++    /* The data pointer is either the SHM segment or a gralloc mapping; neither
++     * belongs to Xlib. */
++    m_image->data = NULL;
++    XDestroyImage(m_image);
++    m_image = NULL;
++}
++
 +void X11NativeWindow::copyToX11(X11NativeWindowBuffer *wnb) {
 +    int ret;
-+    void *vaddr;
-+    std::list<X11NativeWindowBuffer *>::iterator it;
++    void *vaddr = NULL;
 +
 +    ret = hybris_gralloc_lock(wnb->handle, GRALLOC_USAGE_SW_READ_OFTEN, 0, 0, wnb->width, wnb->height, &vaddr);
 +    TRACE("wnb:%p gralloc lock returns %i", wnb, ret);
 +    TRACE("wnb:%p lock to vaddr %p", wnb, vaddr);
 +    TRACE("wnb:%p width=%d stride=%d height=%d format=%d", wnb, wnb->width, wnb->stride, wnb->height, wnb->format);
 +
-+    if (!m_image)
++    if (ret != 0 || vaddr == NULL)
 +    {
-+        if (m_useShm)
-+        {
-+            m_image = XShmCreateImage(m_display,
-+                        CopyFromParent,
-+                        m_depth,
-+                        ZPixmap, 0, &m_shminfo, m_width, m_height);
-+
-+            m_shminfo.shmid = shmget(IPC_PRIVATE,
-+                m_image->bytes_per_line * m_image->height,
-+                IPC_CREAT|0777);
-+
-+            m_shminfo.shmaddr = m_image->data = (char *)shmat(m_shminfo.shmid, 0, 0);
-+            m_shminfo.readOnly = 0;
-+
-+            TRACE("m_shminfo.shmaddr %p", m_shminfo.shmaddr);
-+
-+            XShmAttach(m_display, &m_shminfo);
-+        }
-+        else
-+        {
-+            m_image = XCreateImage(m_display,
-+                                CopyFromParent,
-+                                m_depth,
-+                                ZPixmap, 0, (char *)vaddr, m_width, m_height,
-+                                m_depth <= 16 ? 16 : 32, 0);
-+        }
++        HYBRIS_ERROR("gralloc lock of buffer %p failed: %d", wnb, ret);
++        return;
 +    }
 +
++    /* Rebuild the image when the window was resized; the buffer may still be
++     * the old size for this frame, so every copy below is clamped. */
++    if (m_image && ((unsigned int)m_image->width != m_width || (unsigned int)m_image->height != m_height))
++        destroyImage();
++    if (!m_image && !createImage())
++    {
++        HYBRIS_ERROR("cannot create an XImage for %ux%u depth %u", m_width, m_height, m_depth);
++        hybris_gralloc_unlock(wnb->handle);
++        return;
++    }
++
++    const int src_bpp = (wnb->format == HAL_PIXEL_FORMAT_RGB_565) ? 2 : 4;
++    const size_t src_line = (size_t)wnb->stride * src_bpp;
++    const unsigned int rows = (unsigned int)wnb->height < (unsigned int)m_image->height
++                            ? (unsigned int)wnb->height : (unsigned int)m_image->height;
++    const unsigned int cols = (unsigned int)wnb->width < (unsigned int)m_image->width
++                            ? (unsigned int)wnb->width : (unsigned int)m_image->width;
 +
 +    if (m_useShm)
 +    {
-+        const int src_bpp = (wnb->format == HAL_PIXEL_FORMAT_RGB_565) ? 2 : 4;
-+        const size_t src_line = (size_t)wnb->stride * src_bpp;
 +        const size_t copy_line = src_line < (size_t)m_image->bytes_per_line
 +                               ? src_line : (size_t)m_image->bytes_per_line;
-+        for (int y = 0; y < m_height; ++y)
++        for (unsigned int y = 0; y < rows; ++y)
 +            memcpy(m_image->data + (size_t)y * m_image->bytes_per_line,
 +                   (char *)vaddr + (size_t)y * src_line, copy_line);
 +        hybris_gralloc_unlock(wnb->handle);
-+        XShmPutImage(m_display, m_window, m_gc, m_image, 0, 0, 0, 0, m_width, m_height, 0);
++        XShmPutImage(m_display, m_window, m_gc, m_image, 0, 0, 0, 0, cols, rows, False);
 +        /* Do not recycle the single SHM image while Xorg is still reading it. */
 +        XSync(m_display, False);
 +    }
 +    else
 +    {
++        /* Present straight out of the gralloc mapping; the row pitch is the
++         * buffer stride, not the window width. */
 +        m_image->data = (char *)vaddr;
-+        XPutImage(m_display, m_window, m_gc, m_image, 0, 0, 0, 0, m_width, m_height);
++        m_image->bytes_per_line = src_line;
++        XPutImage(m_display, m_window, m_gc, m_image, 0, 0, 0, 0, cols, rows);
++        m_image->data = NULL;
 +        hybris_gralloc_unlock(wnb->handle);
 +    }
-+
-+    lock();
-+
-+    ++m_freeBufs;
-+    HYBRIS_TRACE_COUNTER("x11-platform", "m_freeBufs", "%i", m_freeBufs);
-+    for (it = m_bufList.begin(); it != m_bufList.end(); it++)
-+    {
-+        (*it)->youngest = 0;
-+    }
-+    wnb->youngest = 1;
-+    wnb->busy = 0;
-+
-+    unlock();
 +}
 +
 +void X11NativeWindow::tryEnableDRIHybris()
@@ -1965,6 +2000,9 @@ index 0000000..542461d
 +
 +    error = xcb_request_check(m_connection, cookie);
 +    if (error) {
++        free(error);
++        xcb_unregister_for_special_event(m_connection, m_specialEvent);
++        m_specialEvent = 0;
 +        return;
 +    }
 +
@@ -1978,7 +2016,7 @@ index 0000000..542461d
 +    switch (ge->evtype) {
 +    case XCB_PRESENT_CONFIGURE_NOTIFY: {
 +        xcb_present_configure_notify_event_t *ce = (xcb_present_configure_notify_event_t *) ge;
-+        printf("XCB_PRESENT_CONFIGURE_NOTIFY: %dx%d\n", ce->width, ce->height);
++        TRACE("XCB_PRESENT_CONFIGURE_NOTIFY: %dx%d", ce->width, ce->height);
 +        resize(ce->width, ce->height);
 +        break;
 +    }
@@ -2010,17 +2048,17 @@ index 0000000..542461d
 +// vim: noai:ts=4:sw=4:ss=4:expandtab
 diff --git a/hybris/egl/platforms/x11/x11_window.h b/hybris/egl/platforms/x11/x11_window.h
 new file mode 100644
-index 0000000..2d742b2
+index 0000000..0571fa3
 --- /dev/null
 +++ b/hybris/egl/platforms/x11/x11_window.h
-@@ -0,0 +1,203 @@
+@@ -0,0 +1,192 @@
 +/****************************************************************************************
 + **
 + ** Copyright (C) 2013 Jolla Ltd.
 + ** Contact: Carsten Munk <carsten.munk@jollamobile.com>
 + ** All rights reserved.
 + **
-+ ** This file is part of Wayland enablement for libhybris
++ ** This file is part of X11 enablement for libhybris
 + **
 + ** You may use this file under the terms of the GNU Lesser General
 + ** Public License version 2.1 as published by the Free Software Foundation
@@ -2043,7 +2081,6 @@ index 0000000..2d742b2
 +#ifndef X11_WINDOW_H
 +#define X11_WINDOW_H
 +#include "nativewindowbase.h"
-+#include <linux/fb.h>
 +#include <hybris/gralloc/gralloc.h>
 +extern "C" {
 +#include <X11/Xlib-xcb.h>
@@ -2058,7 +2095,7 @@ index 0000000..2d742b2
 +class X11NativeWindowBuffer : public BaseNativeWindowBuffer
 +{
 +public:
-+    X11NativeWindowBuffer() : busy(0), youngest(0), other(0) {}
++    X11NativeWindowBuffer() : busy(0), youngest(0), other(0), windowDepth(0), pixmap(0) {}
 +    X11NativeWindowBuffer(ANativeWindowBuffer *other)
 +    {
 +        ANativeWindowBuffer::width = other->width;
@@ -2075,6 +2112,7 @@ index 0000000..2d742b2
 +        this->busy = 0;
 +        this->other = other;
 +        this->youngest = 0;
++        this->windowDepth = 0;
 +        this->pixmap = 0;
 +    }
 +
@@ -2124,12 +2162,6 @@ index 0000000..2d742b2
 +    {
 +        hybris_gralloc_release(this->handle, 1);
 +    }
-+
-+protected:
-+    void* vaddr;
-+
-+public:
-+
 +};
 +
 +class X11NativeWindow : public BaseNativeWindow {
@@ -2139,9 +2171,7 @@ index 0000000..2d742b2
 +
 +    void lock();
 +    void unlock();
-+    void frame();
 +    void resize(unsigned int width, unsigned int height);
-+    void releaseBuffer(struct wl_buffer *buffer);
 +
 +    virtual int setSwapInterval(int interval);
 +    void prepareSwap(EGLint *damage_rects, EGLint damage_n_rects);
@@ -2172,16 +2202,15 @@ index 0000000..2d742b2
 +    X11NativeWindowBuffer *addBuffer();
 +    void destroyBuffer(X11NativeWindowBuffer *);
 +    void destroyBuffers();
-+    int readQueue(bool block);
++    void readQueue();
 +
++    bool createImage();
++    void destroyImage();
 +    void copyToX11(X11NativeWindowBuffer *wnb);
 +    void tryEnableDRIHybris();
 +    void handlePresentEvent(xcb_present_generic_event_t *ge);
 +
 +    std::list<X11NativeWindowBuffer *> m_bufList;
-+    std::list<X11NativeWindowBuffer *> fronted;
-+    std::list<X11NativeWindowBuffer *> posted;
-+    std::list<X11NativeWindowBuffer *> post_registered;
 +    std::deque<X11NativeWindowBuffer *> queue;
 +
 +    Display* m_display;
@@ -2197,7 +2226,7 @@ index 0000000..2d742b2
 +
 +    bool m_useShm;
 +    bool m_haveDRIHybris;
-+    
++
 +    X11NativeWindowBuffer *m_lastBuffer;
 +    unsigned int m_width;
 +    unsigned int m_height;
@@ -2208,8 +2237,6 @@ index 0000000..2d742b2
 +    unsigned int m_usage;
 +
 +    pthread_mutex_t mutex;
-+    pthread_cond_t cond;
-+    int m_queueReads;
 +    int m_freeBufs;
 +    EGLint *m_damage_rects, m_damage_n_rects;
 +    int m_swap_interval;
@@ -2518,3 +2545,134 @@ index 0000000..974828d
 +#endif
 +
 +#endif //DRIHYBRIS_PROTO_H
+diff --git a/hybris/egl/ws.c b/hybris/egl/ws.c
+index ed20a1c..bbd28a3 100644
+--- a/hybris/egl/ws.c
++++ b/hybris/egl/ws.c
+@@ -126,4 +126,12 @@ void ws_setSwapInterval(EGLDisplay dpy, EGLNativeWindowType win, EGLint interval
+ 		ws->setSwapInterval(dpy, win, interval);
+ }
+ 
++EGLBoolean ws_eglGetConfigAttrib(struct _EGLDisplay *display, EGLConfig config, EGLint attribute, EGLint *value)
++{
++	_init_ws();
++	if (ws->eglGetConfigAttrib)
++		return ws->eglGetConfigAttrib(display, config, attribute, value);
++	return EGL_FALSE;
++}
++
+ // vim:ts=4:sw=4:noexpandtab
+diff --git a/hybris/egl/ws.h b/hybris/egl/ws.h
+index c4811c0..28a9f17 100644
+--- a/hybris/egl/ws.h
++++ b/hybris/egl/ws.h
+@@ -37,6 +37,7 @@ struct ws_module {
+ 	void (*prepareSwap)(EGLDisplay dpy, EGLNativeWindowType win, EGLint *damage_rects, EGLint damage_n_rects);
+ 	void (*finishSwap)(EGLDisplay dpy, EGLNativeWindowType win);
+ 	void (*setSwapInterval)(EGLDisplay dpy, EGLNativeWindowType win, EGLint interval);
++	EGLBoolean (*eglGetConfigAttrib)(struct _EGLDisplay *display, EGLConfig config, EGLint attribute, EGLint *value);
+ };
+ 
+ struct _EGLDisplay *ws_GetDisplay(EGLNativeDisplayType native);
+@@ -49,5 +50,6 @@ const char *ws_eglQueryString(EGLDisplay dpy, EGLint name, const char *(*real_eg
+ void ws_prepareSwap(EGLDisplay dpy, EGLNativeWindowType win, EGLint *damage_rects, EGLint damage_n_rects);
+ void ws_finishSwap(EGLDisplay dpy, EGLNativeWindowType win);
+ void ws_setSwapInterval(EGLDisplay dpy, EGLNativeWindowType win, EGLint interval);
++EGLBoolean ws_eglGetConfigAttrib(struct _EGLDisplay *display, EGLConfig config, EGLint attribute, EGLint *value);
+ 
+ #endif
+diff --git a/hybris/gralloc/gralloc.c b/hybris/gralloc/gralloc.c
+index 769b806..905d06a 100644
+--- a/hybris/gralloc/gralloc.c
++++ b/hybris/gralloc/gralloc.c
+@@ -179,6 +179,12 @@ static void gralloc1_init(void)
+         free(gralloc1_capabilities);
+     }
+ 
++    /* Samsung's Android 9 Exynos gralloc releases and deletes native handles
++     * but does not advertise GRALLOC1_CAPABILITY_RELEASE_IMPLY_DELETE. Avoid a
++     * host-side native_handle_delete double free when explicitly requested. */
++    if (getenv("HYBRIS_GRALLOC1_RELEASE_IMPLY_DELETE"))
++        gralloc1_release_implies_delete = 1;
++
+     gralloc1_create_descriptor = (GRALLOC1_PFN_CREATE_DESCRIPTOR)gralloc1_device->getFunction(gralloc1_device, GRALLOC1_FUNCTION_CREATE_DESCRIPTOR);
+     gralloc1_destroy_descriptor = (GRALLOC1_PFN_DESTROY_DESCRIPTOR)gralloc1_device->getFunction(gralloc1_device, GRALLOC1_FUNCTION_DESTROY_DESCRIPTOR);
+     gralloc1_set_consumer_usage = (GRALLOC1_PFN_SET_CONSUMER_USAGE)gralloc1_device->getFunction(gralloc1_device, GRALLOC1_FUNCTION_SET_CONSUMER_USAGE);
+diff --git a/hybris/include/hybris/common/musl_compat.h b/hybris/include/hybris/common/musl_compat.h
+new file mode 100644
+index 0000000..ad36fc4
+--- /dev/null
++++ b/hybris/include/hybris/common/musl_compat.h
+@@ -0,0 +1,21 @@
++/*
++ * Minimal glibc-isms that libhybris relies on but musl does not provide.
++ * Included from the non-glibc code paths only (#ifndef __GLIBC__).
++ */
++#ifndef HYBRIS_COMMON_MUSL_COMPAT_H_
++#define HYBRIS_COMMON_MUSL_COMPAT_H_
++
++#include <errno.h>
++#include <unistd.h>
++
++/* Taken from glibc's unistd.h. */
++#ifndef TEMP_FAILURE_RETRY
++#define TEMP_FAILURE_RETRY(expression) \
++  (__extension__                                                              \
++    ({ long int __result;                                                     \
++       do __result = (long int) (expression);                                 \
++       while (__result == -1L && errno == EINTR);                             \
++       __result; }))
++#endif
++
++#endif /* HYBRIS_COMMON_MUSL_COMPAT_H_ */
+diff --git a/hybris/libsync/sync.c b/hybris/libsync/sync.c
+index dbc3eba..e66840a 100644
+--- a/hybris/libsync/sync.c
++++ b/hybris/libsync/sync.c
+@@ -27,6 +27,7 @@
+ #include <linux/sync.h>
+ #include <linux/sw_sync.h>
+ #else
++#include <sys/cdefs.h>
+ #include <sync/sync.h>
+ #endif
+ 
+diff --git a/hybris/tests/Makefile.am b/hybris/tests/Makefile.am
+index 6f97c3e..67c8d0f 100644
+--- a/hybris/tests/Makefile.am
++++ b/hybris/tests/Makefile.am
+@@ -7,7 +7,6 @@ bin_PROGRAMS = \
+ 	test_sensors \
+ 	test_input \
+ 	test_lights \
+-	test_camera \
+ 	test_vibrator \
+ 	test_media \
+ 	test_recorder \
+@@ -18,6 +17,11 @@ bin_PROGRAMS = \
+ 	test_hwcomposer \
+ 	test_nfc
+ 
++# test_camera links libwayland-egl, so it is only buildable with --enable-wayland.
++if WANT_WAYLAND
++bin_PROGRAMS += test_camera
++endif
++
+ test_audio_SOURCES = test_audio.c
+ test_audio_CFLAGS = \
+ 	-I$(top_srcdir)/include \
+diff --git a/hybris/tests/test_camera.c b/hybris/tests/test_camera.c
+index 7ac81f4..b7993a9 100644
+--- a/hybris/tests/test_camera.c
++++ b/hybris/tests/test_camera.c
+@@ -45,6 +45,10 @@
+ #include <sys/stat.h>
+ #include <sys/types.h>
+ 
++#ifndef __GLIBC__
++#include <hybris/common/musl_compat.h>
++#endif
++
+ int shot_counter = 1;
+ int32_t current_zoom_level = 1;
+ bool new_camera_frame_available = true;
